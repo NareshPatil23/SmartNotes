@@ -1,0 +1,11 @@
+{
+  "name": "smart-exam-notes-generator",
+  "version": "1.0.0",
+  "scripts": {
+    "install:all": "npm install && cd frontend && npm install && cd ../backend && npm install",
+    "build:frontend": "cd frontend && npm run build",
+    "build": "npm run install:all && npm run build:frontend",
+    "start": "cd backend && node index.js",
+    "deploy": "npm run build && npm start"
+  }
+}
