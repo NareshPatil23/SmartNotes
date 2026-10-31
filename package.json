@@ -1,11 +1,14 @@
 {
-  "name": "smart-exam-notes-generator",
+  "name": "smartnotes-ai",
   "version": "1.0.0",
   "scripts": {
-    "install:all": "npm install && cd frontend && npm install && cd ../backend && npm install",
+    "build": "cd frontend && npm run build && node -e \"const fs = require('fs'); fs.cpSync('dist', '../dist', { recursive: true });\"",
     "build:frontend": "cd frontend && npm run build",
-    "build": "npm run install:all && npm run build:frontend",
-    "start": "cd backend && node index.js",
-    "deploy": "npm run build && npm start"
+    "preview": "cd frontend && npm run preview",
+    "start": "cd backend && node index.js"
+  },
+  "dependencies": {
+    "@neon/config": "^1.10.0",
+    "@neon/env": "^1.6.8"
   }
 }

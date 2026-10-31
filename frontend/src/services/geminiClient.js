@@ -1,0 +1,382 @@
+/**
+ * Client-Side Direct Gemini API Service
+ * 
+ * Secure Browser-to-Google Gemini integration:
+ * - API keys are stored only in localStorage/sessionStorage.
+ * - Keys are NEVER sent to local or third-party servers.
+ * - Keys are NEVER placed in query strings or logged.
+ * - All requests are authenticated via the 'x-goog-api-key' request header.
+ */
+
+const STORAGE_KEY = 'smartnotes_gemini_api_key';
+const REMEMBER_KEY = 'smartnotes_gemini_remember';
+
+// Allowed models with fallback
+export const DEFAULT_MODEL = 'gemini-2.5-flash';
+
+/**
+ * Retrieve the active Gemini API key from browser storage
+ */
+export function getStoredApiKey() {
+  if (typeof window === 'undefined') return null;
+  // Check sessionStorage first, then fallback to localStorage
+  const sessionKey = sessionStorage.getItem(STORAGE_KEY);
+  if (sessionKey && sessionKey.trim()) return sessionKey.trim();
+
+  const localKey = localStorage.getItem(STORAGE_KEY);
+  if (localKey && localKey.trim()) return localKey.trim();
+
+  return null;
+}
+
+/**
+ * Check if the user chose to remember the key on this device
+ */
+export function isRemembered() {
+  if (typeof window === 'undefined') return false;
+  return localStorage.getItem(REMEMBER_KEY) === 'true';
+}
+
+/**
+ * Store the Gemini API key in browser storage
+ * @param {string} key - Raw Gemini API key
+ * @param {boolean} remember - If true, persist in localStorage; otherwise sessionStorage
+ */
+export function saveApiKey(key, remember = false) {
+  if (typeof window === 'undefined') return;
+  const cleanKey = (key || '').trim();
+  if (!cleanKey) {
+    removeApiKey();
+    return;
+  }
+
+  if (remember) {
+    localStorage.setItem(STORAGE_KEY, cleanKey);
+    localStorage.setItem(REMEMBER_KEY, 'true');
+    sessionStorage.removeItem(STORAGE_KEY);
+  } else {
+    sessionStorage.setItem(STORAGE_KEY, cleanKey);
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(REMEMBER_KEY);
+  }
+}
+
+/**
+ * Delete the key from all browser storage
+ */
+export function removeApiKey() {
+  if (typeof window === 'undefined') return;
+  sessionStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(REMEMBER_KEY);
+}
+
+/**
+ * Clear non-remembered key upon user logout
+ */
+export function handleLogoutKeyCleanup() {
+  if (typeof window === 'undefined') return;
+  if (!isRemembered()) {
+    sessionStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(REMEMBER_KEY);
+  }
+}
+
+/**
+ * Return a masked version of the key (e.g. AIza••••••••dlb0)
+ */
+export function getMaskedApiKey() {
+  const key = getStoredApiKey();
+  if (!key) return '';
+  if (key.length <= 8) return '••••••••';
+  return `${key.slice(0, 4)}••••••••${key.slice(-4)}`;
+}
+
+/**
+ * Friendly error parser for Gemini REST responses
+ */
+function parseGeminiError(status, errorObj) {
+  const message = errorObj?.error?.message || '';
+  const statusText = errorObj?.error?.status || '';
+
+  if (status === 400 || message.includes('API_KEY_INVALID') || message.includes('API key not valid')) {
+    return 'Invalid API key. Please check your key from Google AI Studio and try again.';
+  }
+  if (status === 403 || statusText === 'PERMISSION_DENIED' || message.includes('permission') || message.includes('not enabled')) {
+    return 'Key without access. Ensure the Generative Language API is enabled for this Google Cloud project.';
+  }
+  if (status === 429 || statusText === 'RESOURCE_EXHAUSTED' || message.includes('quota') || message.includes('Quota')) {
+    return 'Quota exceeded (429). Your Google Gemini API rate limit or project quota has been reached.';
+  }
+  if (message) {
+    return `Gemini API error (${status}): ${message}`;
+  }
+  return `Google Gemini API returned error HTTP ${status}. Please verify your key.`;
+}
+
+/**
+ * Validate an API key with a minimal test request
+ * Uses a tiny 1-token test payload to verify validity without consuming meaningful quota
+ */
+export async function validateGeminiApiKey(apiKey) {
+  const cleanKey = (apiKey || '').trim();
+  if (!cleanKey) {
+    return { valid: false, error: 'Please enter a Gemini API key.' };
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`;
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': cleanKey
+      },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: 'Ping' }] }],
+        generationConfig: { maxOutputTokens: 2 }
+      })
+    });
+
+    if (!res.ok) {
+      const errorJson = await res.json().catch(() => null);
+      const friendlyMsg = parseGeminiError(res.status, errorJson);
+      return { valid: false, error: friendlyMsg, status: res.status };
+    }
+
+    return { valid: true };
+  } catch (err) {
+    return {
+      valid: false,
+      error: 'Network failure: Unable to connect to Google Gemini API. Please check your internet connection.'
+    };
+  }
+}
+
+/**
+ * Direct browser call to generate content with Gemini
+ */
+export async function generateGeminiContent({
+  prompt,
+  systemInstruction = '',
+  model = DEFAULT_MODEL,
+  apiKey = null,
+  generationConfig = {}
+}) {
+  const keyToUse = apiKey || getStoredApiKey();
+  if (!keyToUse) {
+    const err = new Error('No Gemini API key found. Please add your API key.');
+    err.code = 'NO_API_KEY';
+    throw err;
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+  const requestBody = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.2,
+      ...generationConfig
+    }
+  };
+
+  if (systemInstruction) {
+    requestBody.systemInstruction = {
+      parts: [{ text: systemInstruction }]
+    };
+  }
+
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': keyToUse
+      },
+      body: JSON.stringify(requestBody)
+    });
+  } catch (netErr) {
+    throw new Error('Network failure: Unable to reach Google Gemini API. Please check your connection.');
+  }
+
+  if (!response.ok) {
+    const errorJson = await response.json().catch(() => null);
+    const friendlyMsg = parseGeminiError(response.status, errorJson);
+    const err = new Error(friendlyMsg);
+    err.status = response.status;
+    err.details = errorJson;
+    throw err;
+  }
+
+  const data = await response.json();
+  const textOutput = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  return textOutput;
+}
+
+/**
+ * Format academic study notes directly in the browser using the user's Gemini key
+ */
+export async function formatNotesDirect({ text, isHandwritten = false, model = DEFAULT_MODEL, apiKey = null }) {
+  if (!text || !text.trim()) {
+    throw new Error('No text provided to format.');
+  }
+
+  const systemInstruction = `You are a Professional Academic Note Formatter. Transform the input into a structured educational note using clean semantic HTML and standard LaTeX math ($ for inline, $$ for block).
+
+${isHandwritten ? `HANDWRITTEN MODE:
+- Start questions with <h2 class="qa-question">Q1. ...</h2>
+- Use <h2> and <h3> section headings.
+- Use <strong> for terms, <mark> for vital definitions, and <ul>/<li> for lists.
+- Do NOT output <style> tags or inline styles.` : `MODERN MODE:
+- Use clean layout with <h1> titles, <h2> sections, <blockquote> definitions.
+- Convert formulas into $$...$$ or $...$.
+- Wrap code blocks in <pre><code class="language-[lang]">[code]</code></pre>.
+- Wrap tables in standard <table>, <thead>, <tbody>, <th>, <td>.
+- Wrap text/ASCII diagrams in <div class="mermaid">...</div>.`}
+
+STRICT WORD FIDELITY:
+- Retain all core academic content and wording accurately, adding semantic formatting and LaTeX math.`;
+
+  const rawOutput = await generateGeminiContent({
+    prompt: `Transform this academic study text into clean formatted HTML with LaTeX:\n\n${text}`,
+    systemInstruction,
+    model,
+    apiKey
+  });
+
+  // Strip Markdown code fence wrappers if model returns ```html ... ```
+  let cleanHtml = rawOutput.trim();
+  if (cleanHtml.startsWith('```html')) {
+    cleanHtml = cleanHtml.slice(7);
+  } else if (cleanHtml.startsWith('```')) {
+    cleanHtml = cleanHtml.slice(3);
+  }
+  if (cleanHtml.endsWith('```')) {
+    cleanHtml = cleanHtml.slice(0, -3);
+  }
+  return cleanHtml.trim();
+}
+
+/**
+ * Ask PDF conversational chat directly via browser
+ */
+export async function askPdfChatDirect({ messages, pdfText, constraints = [], model = DEFAULT_MODEL, apiKey = null }) {
+  const constraintList = constraints && constraints.length > 0
+    ? constraints.map((c, i) => `${i + 1}. ${c}`).join('\n')
+    : 'No strict formatting constraints.';
+
+  const systemInstruction = `You are an expert academic AI study tutor.
+TEXTBOOK CONTENT CONTEXT:
+\"\"\"
+${pdfText || 'No PDF content provided.'}
+\"\"\"
+
+STRICT ANSWER CONSTRAINTS:
+${constraintList}
+
+INSTRUCTIONS:
+1. Answer the user's question accurately based strictly on the textbook context when relevant.
+2. Follow all formatting constraints exactly.
+3. Be structured, concise, and encourage deep conceptual understanding.`;
+
+  // Build the prompt from chat history
+  const conversationTranscript = messages.map(m => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.content}`).join('\n\n');
+  const lastQuestion = messages[messages.length - 1]?.content || '';
+
+  const prompt = `Conversation History:\n${conversationTranscript}\n\nStudent's latest question: ${lastQuestion}\n\nProvide your tutoring response adhering to all constraints:`;
+
+  return await generateGeminiContent({
+    prompt,
+    systemInstruction,
+    model,
+    apiKey
+  });
+}
+
+/**
+ * Extract Q&A study notes directly in the browser using the user's Gemini key
+ */
+export async function extractNotesDirect({ text, inlineData = null, model = DEFAULT_MODEL, apiKey = null }) {
+  const systemInstruction = `You are an expert academic text-to-HTML study note generation tool.
+Extract comprehensive Question and Answer study pairs from the material.
+For the "answer" field, return beautifully formatted semantic HTML (<p>, <strong>, <ul>, <li>, <mark>, <table>, <pre><code>).
+Use $$...$$ for block math and $...$ for inline math.
+
+CRITICAL OUTPUT FORMAT:
+Output ONLY a raw valid JSON array:
+[
+  {
+    "question": "Question text here",
+    "answer": "<p>Detailed structured HTML answer</p>",
+    "marks": "5"
+  }
+]`;
+
+  const promptText = `Analyze this material and generate comprehensive educational study Q&A pairs:\n\n${text || 'Extract all key questions and answers from the attached document.'}`;
+
+  const requestParts = [{ text: promptText }];
+  if (inlineData) {
+    requestParts.unshift({ inlineData });
+  }
+
+  const keyToUse = apiKey || getStoredApiKey();
+  if (!keyToUse) {
+    const err = new Error('No Gemini API key found. Please add your API key.');
+    err.code = 'NO_API_KEY';
+    throw err;
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': keyToUse
+    },
+    body: JSON.stringify({
+      contents: [{ parts: requestParts }],
+      systemInstruction: { parts: [{ text: systemInstruction }] },
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json'
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const errorJson = await response.json().catch(() => null);
+    const friendlyMsg = parseGeminiError(response.status, errorJson);
+    const err = new Error(friendlyMsg);
+    err.status = response.status;
+    throw err;
+  }
+
+  const data = await response.json();
+  const rawJson = data?.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+  
+  let cleaned = rawJson.trim();
+  if (cleaned.startsWith('```json')) cleaned = cleaned.slice(7);
+  else if (cleaned.startsWith('```')) cleaned = cleaned.slice(3);
+  if (cleaned.endsWith('```')) cleaned = cleaned.slice(0, -3);
+
+  try {
+    return JSON.parse(cleaned.trim());
+  } catch (err) {
+    // Regex fallback
+    const qaList = [];
+    const re = /\{\s*"question"\s*:\s*"([\s\S]*?)"\s*,\s*"answer"\s*:\s*"([\s\S]*?)"(?:\s*,\s*"marks"\s*:\s*"([\s\S]*?)")?\s*\}/gi;
+    let match;
+    while ((match = re.exec(cleaned)) !== null) {
+      qaList.push({
+        question: match[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
+        answer: match[2].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
+        marks: match[3] || '5'
+      });
+    }
+    if (qaList.length > 0) return qaList;
+    throw new Error('AI returned an unexpected format. Please try again.');
+  }
+}

@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Production build output
+dist/
+dist
+
+# Environment variables (client secrets must NEVER be tracked)
+.env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Editor / OS
+.DS_Store
+*.local
+*.timestamp-*.mjs
+stats.html

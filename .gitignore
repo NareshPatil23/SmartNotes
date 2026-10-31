@@ -4,19 +4,59 @@ backend/node_modules/
 frontend/node_modules/
 
 # Build
+dist/
+dist
 frontend/dist/
-*.log
+frontend/dist
 
 # Environment
 .env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 backend/.env
+backend/.env.*
+frontend/.env
+frontend/.env.*
+*.env
 
-# IDE
+# Logs & scratch
+*.log
+logs/
+scratch/
+
+# IDE & OS
 .vscode/
 .idea/
 .DS_Store
 
-# Misc
+# Misc & temporary test/benchmark files
 .gemini/
 backend/test_*.js
+backend/test_*.txt
 backend/list_models.js
+backend/list_gemini.js
+backend/models_list.txt
+backend/scratch.js
+backend/*.pdf
+*.timestamp-*.mjs
+*.report.html
+lighthouse-*.json
+lighthouse-*.report.html
+stats.html
+frontend/stats.html
+
+# Database & Storage
+*.db
+*.sqlite
+*.sqlite3
+backend/smartnotes.db
+backend/uploads/
+uploads/
+
+
+# Local Netlify folder
+.netlify
+.neon
