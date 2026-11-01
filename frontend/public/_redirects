@@ -1,6 +1,2 @@
-# Netlify API Reverse Proxy: proxies /api/* requests to your Render backend
-# REPLACE "https://YOUR-RENDER-BACKEND-URL.onrender.com" WITH YOUR ACTUAL RENDER SERVICE URL
-/api/*    https://YOUR-RENDER-BACKEND-URL.onrender.com/api/:splat    200
-
-# Client-Side Routing SPA Catch-All
-/*        /index.html                                                200
+/api/*  https://smartnotess-52bv.onrender.com/api/:splat  200
+/*      /index.html  200
