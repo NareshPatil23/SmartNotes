@@ -2,7 +2,6 @@ const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
 const { Pool } = require('pg');
-const sqlite3 = require('sqlite3');
 const { resolveNeonHost } = require('./neonDns');
 
 // Load environment variables (.env.local from project root takes top priority)
@@ -19,7 +18,7 @@ const { resolveNeonHost } = require('./neonDns');
   }
 });
 
-let dbType = 'sqlite';
+let dbType = null;
 let pool = null;
 let sqliteDb = null;
 
@@ -28,11 +27,39 @@ const isPostgres = DATABASE_URL && (DATABASE_URL.startsWith('postgres://') || DA
 
 if (isPostgres) {
   dbType = 'postgres';
+  console.log('[Database] Active database mode: Postgres');
 } else {
+  // In production, NEVER fall back to SQLite
+  if (process.env.NODE_ENV === 'production') {
+    console.error('DATABASE_URL is required in production');
+    process.exit(1);
+  }
+
   dbType = 'sqlite';
-  const dbPath = process.env.SQLITE_DB_PATH || path.join(__dirname, '../../smartnotes.db');
-  sqliteDb = new sqlite3.Database(dbPath);
-  console.log(`[Database] Configured for SQLite at ${dbPath}`);
+  console.log('[Database] Active database mode: SQLite');
+}
+
+/**
+ * Lazily loads sqlite3 only in local development when DATABASE_URL is not set.
+ * Never loaded in production or at module evaluation time.
+ */
+function getSqliteDb() {
+  if (sqliteDb) return sqliteDb;
+
+  if (process.env.NODE_ENV === 'production') {
+    console.error('DATABASE_URL is required in production');
+    process.exit(1);
+  }
+
+  try {
+    const sqlite3 = require('sqlite3');
+    const dbPath = process.env.SQLITE_DB_PATH || path.join(__dirname, '../../smartnotes.db');
+    sqliteDb = new sqlite3.Database(dbPath);
+    return sqliteDb;
+  } catch (err) {
+    console.error('[Database] Failed to load sqlite3 for local development:', err.message);
+    throw err;
+  }
 }
 
 async function getPgPool() {
@@ -54,7 +81,6 @@ async function getPgPool() {
     keepAlive: true
   });
 
-  console.log('[Database] Configured for PostgreSQL (Neon Serverless Pool).');
   return pool;
 }
 
@@ -90,18 +116,19 @@ async function query(sql, params = []) {
       }
     }
   } else {
+    const db = getSqliteDb();
     return new Promise((resolve, reject) => {
       // Convert $1, $2, $3 to ? for SQLite
       let sqliteSql = sql.replace(/\$(\d+)/g, '?');
       
       const isSelect = /^\s*(SELECT|PRAGMA)/i.test(sqliteSql);
       if (isSelect) {
-        sqliteDb.all(sqliteSql, params, (err, rows) => {
+        db.all(sqliteSql, params, (err, rows) => {
           if (err) return reject(err);
           resolve({ rows: rows || [], rowCount: (rows || []).length });
         });
       } else {
-        sqliteDb.run(sqliteSql, params, function (err) {
+        db.run(sqliteSql, params, function (err) {
           if (err) return reject(err);
           resolve({ rows: [], rowCount: this.changes, lastID: this.lastID });
         });
@@ -319,6 +346,7 @@ async function initDatabase() {
     const activePool = await getPgPool();
     await activePool.query(schemaPostgres);
   } else {
+    const db = getSqliteDb();
     // Run statements sequentially for SQLite
     const statements = schemaSqlite
       .split(';')
@@ -327,7 +355,7 @@ async function initDatabase() {
 
     for (const stmt of statements) {
       await new Promise((resolve, reject) => {
-        sqliteDb.run(stmt, (err) => {
+        db.run(stmt, (err) => {
           if (err) return reject(err);
           resolve();
         });

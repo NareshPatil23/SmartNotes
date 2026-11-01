@@ -24,7 +24,9 @@
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.1",
     "pg": "^8.23.0",
-    "puppeteer": "^24.43.0",
+    "puppeteer": "^24.43.0"
+  },
+  "optionalDependencies": {
     "sqlite3": "^6.0.1"
   }
 }
