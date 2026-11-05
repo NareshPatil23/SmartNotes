@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "build": "echo 'Backend build ready'",
+    "build": "npx puppeteer browsers install chrome",
+    "postinstall": "puppeteer browsers install chrome || true",
     "migrate": "node scripts/migrate-neon.js",
     "dev": "node --watch --watch-path=index.js index.js"
   },
@@ -24,7 +25,8 @@
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.1",
     "pg": "^8.23.0",
-    "puppeteer": "^24.43.0"
+    "puppeteer": "^24.43.0",
+    "sanitize-html": "^2.18.1"
   },
   "optionalDependencies": {
     "sqlite3": "^6.0.1"

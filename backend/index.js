@@ -28,11 +28,12 @@ const mammoth = require('mammoth');
 const puppeteer = require('puppeteer');
 const pdf = require('pdf-parse');
 
-const { initDatabase } = require('./src/config/db');
-const { optionalAuth } = require('./src/middleware/auth');
+const { initDatabase, query } = require('./src/config/db');
+const { optionalAuth, requireAuth } = require('./src/middleware/auth');
 const { apiLimiter, authLimiter, aiLimiter, heavyLimiter, validateSsrfUrl } = require('./src/middleware/security');
 const { resolveAIClient } = require('./src/services/aiService');
 const { checkCanGenerate, recordGeneration } = require('./src/services/usageService');
+const sanitizeHtml = require('sanitize-html');
 
 // Routers
 const authRoutes = require('./src/routes/auth');
@@ -113,6 +114,9 @@ function getFileDetails(file) {
 
 function getSystemBrowserExecutable() {
   const candidatePaths = [
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
     'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
     'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
     'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -936,11 +940,39 @@ app.post('/api/test-connection', async (req, res) => {
   }
 });
 
-// Endpoint to generate PDF using Puppeteer with advanced styling options
-app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
+// Pre-cache local server fonts as base64 data URIs for self-contained, offline-safe PDF rendering
+const fontAssetsDir = path.join(__dirname, 'assets', 'fonts');
+let cachedFontFaceCss = '';
+try {
+  const fontDefinitions = [
+    { family: 'Caveat', weight: '400', style: 'normal', file: 'Caveat-Regular.woff2' },
+    { family: 'Caveat', weight: '700', style: 'normal', file: 'Caveat-Bold.woff2' },
+    { family: 'Kalam', weight: '400', style: 'normal', file: 'Kalam-Regular.woff2' },
+    { family: 'Kalam', weight: '700', style: 'normal', file: 'Kalam-Bold.woff2' },
+    { family: 'Inter', weight: '400', style: 'normal', file: 'Inter-Regular.woff2' },
+    { family: 'Inter', weight: '700', style: 'normal', file: 'Inter-Bold.woff2' }
+  ];
+  cachedFontFaceCss = fontDefinitions.map(f => {
+    const fontPath = path.join(fontAssetsDir, f.file);
+    if (fs.existsSync(fontPath)) {
+      const b64 = fs.readFileSync(fontPath).toString('base64');
+      return `@font-face { font-family: '${f.family}'; font-style: ${f.style}; font-weight: ${f.weight}; font-display: swap; src: url(data:font/woff2;base64,${b64}) format('woff2'); }`;
+    }
+    return '';
+  }).filter(Boolean).join('\n');
+} catch (fontErr) {
+  console.warn('[Backend] Could not load cached font files:', fontErr.message);
+}
+
+// Single-concurrency lock to protect 512MB RAM environment on Render
+let isPdfExportInProgress = false;
+
+// Endpoint to generate PDF using Puppeteer with hardened concurrency, security, and timeout
+app.post('/api/generate-pdf', requireAuth, heavyLimiter, async (req, res) => {
   const { 
     html, 
     filename, 
+    noteId,
     isHandwrittenMode,
     theme = 'default',
     fontFamily = 'Inter',
@@ -959,6 +991,25 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
 
   if (!html) return res.status(400).json({ error: 'No HTML content provided' });
 
+  // Authorization: users may only export notes that belong to them
+  if (noteId) {
+    try {
+      const noteCheck = await query('SELECT id FROM notes WHERE id = $1 AND user_id = $2', [noteId, req.user.id]);
+      if (noteCheck.rows.length === 0) {
+        return res.status(403).json({ error: 'Forbidden: You can only export your own notes.' });
+      }
+    } catch (dbErr) {
+      console.error('[Backend] Note ownership verification failed:', dbErr.message);
+      return res.status(500).json({ error: 'Database check failed' });
+    }
+  }
+
+  // Enforce single concurrency to protect 512 MB memory limit
+  if (isPdfExportInProgress) {
+    return res.status(429).json({ error: 'Another PDF export is in progress. Please wait a few seconds and try again.' });
+  }
+  isPdfExportInProgress = true;
+
   const marginMap = {
     narrow: { top: '15mm', right: '10mm', bottom: '15mm', left: '10mm' },
     normal: { top: '25mm', right: '20mm', bottom: '25mm', left: '20mm' },
@@ -974,7 +1025,23 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
       const launchOptions = {
         headless: true,
         userDataDir: uniqueUserDataDir,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--no-zygote',
+          '--single-process',
+          '--disable-extensions',
+          '--disable-background-networking',
+          '--disable-default-apps',
+          '--disable-sync',
+          '--disable-translate',
+          '--metrics-recording-only',
+          '--mute-audio',
+          '--no-first-run',
+          '--safebrowsing-disable-auto-update'
+        ]
       };
       if (systemBrowser) {
         launchOptions.executablePath = systemBrowser;
@@ -982,7 +1049,62 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
       browser = await puppeteer.launch(launchOptions);
       const page = await browser.newPage();
       
-      // Determine font family import and style
+      // Security: Disable in-page JavaScript execution
+      await page.setJavaScriptEnabled(false);
+
+      // Security: Intercept requests to block file://, SSRF, and external network calls
+      await page.setRequestInterception(true);
+      page.on('request', (interceptedReq) => {
+        const url = interceptedReq.url();
+        const resType = interceptedReq.resourceType();
+        if (url.startsWith('file:') || (!url.startsWith('http:') && !url.startsWith('https:') && !url.startsWith('data:'))) {
+          return interceptedReq.abort();
+        }
+        const lowerUrl = url.toLowerCase();
+        if (
+          lowerUrl.includes('localhost') ||
+          lowerUrl.includes('127.0.0.1') ||
+          lowerUrl.includes('169.254.169.254') ||
+          lowerUrl.includes('0.0.0.0') ||
+          lowerUrl.includes('[::1]')
+        ) {
+          return interceptedReq.abort();
+        }
+        if (resType === 'image' || resType === 'font') {
+          return interceptedReq.continue();
+        }
+        return interceptedReq.abort();
+      });
+
+      // HTML Sanitization: remove dangerous tags, event handlers, and scripts
+      const cleanHtml = sanitizeHtml(html, {
+        allowedTags: sanitizeHtml.defaults.allowedTags.concat([
+          'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'span', 'div', 'img', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
+          'hr', 'mark', 'code', 'pre', 'svg', 'path', 'g', 'rect', 'circle', 'line', 'polyline', 'polygon',
+          'text', 'tspan', 'defs', 'clippath'
+        ]),
+        allowedAttributes: {
+          '*': ['class', 'style', 'id', 'width', 'height', 'align', 'aria-hidden'],
+          'a': ['href', 'name', 'target'],
+          'img': ['src', 'alt', 'width', 'height'],
+          'svg': ['viewBox', 'width', 'height', 'fill', 'stroke', 'xmlns', 'version', 'preserveAspectRatio'],
+          'path': ['d', 'fill', 'stroke', 'stroke-width', 'stroke-linecap', 'stroke-linejoin'],
+          'g': ['fill', 'stroke', 'transform', 'class'],
+          'rect': ['x', 'y', 'width', 'height', 'fill', 'stroke', 'rx', 'ry'],
+          'circle': ['cx', 'cy', 'r', 'fill', 'stroke'],
+          'line': ['x1', 'y1', 'x2', 'y2', 'stroke', 'stroke-width'],
+          'polyline': ['points', 'stroke', 'fill'],
+          'polygon': ['points', 'stroke', 'fill'],
+          'text': ['x', 'y', 'fill', 'font-size', 'font-family', 'text-anchor']
+        },
+        allowedSchemes: ['http', 'https', 'data'],
+        disallowedTagsMode: 'discard'
+      });
+
+      const safeWatermark = watermarkText ? sanitizeHtml(watermarkText, { allowedTags: [], allowedAttributes: {} }) : '';
+      const safeLogoUrl = (logoUrl && typeof logoUrl === 'string' && (logoUrl.startsWith('http://') || logoUrl.startsWith('https://') || logoUrl.startsWith('data:image/'))) ? logoUrl : '';
+
+      // Determine font family styling
       let fontStyle = '';
       if (fontFamily === 'Inter' || fontFamily === 'Roboto' || fontFamily === 'Outfit') {
         fontStyle = `font-family: '${fontFamily}', sans-serif;`;
@@ -1052,30 +1174,9 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
         <html>
         <head>
           <meta charset="UTF-8">
-          <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&family=Inter:wght@400;600;700;800&family=Kalam:wght@300;400;700&family=Roboto:wght@400;500;700&family=Outfit:wght@300;400;600;700&family=Lora:ital,wght@0,400..700;1,400..700&family=Playfair+Display:ital,wght@0,400..900;1,400..900&family=Fira+Code:wght@400;600&display=swap" rel="stylesheet">
-          
-          <!-- KaTeX for PDF -->
-          <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
-          <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
-          <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
-
-          <!-- Mermaid JS for Diagrams -->
-          <script src="https://cdn.jsdelivr.net/npm/mermaid@10.8.0/dist/mermaid.min.js"></script>
-          <script>
-            mermaid.initialize({
-              startOnLoad: false,
-              theme: ${theme === 'dark' ? "'dark'" : "'default'"},
-              securityLevel: 'loose',
-              fontFamily: "'Inter', sans-serif",
-              look: ${isHandwrittenMode ? "'handDrawn'" : "'classic'"}
-            });
-          </script>
-
-          <!-- Highlight.js for PDF Code Syntax Highlighting -->
-          <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
-          <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-
           <style>
+            ${cachedFontFaceCss}
+
             body { 
               margin: 0; 
               padding: 0; 
@@ -1085,8 +1186,7 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
               line-height: ${lineSpacing};
             }
             
-            /* Under handwritten mode, ruled paper styles apply.
-               Under modern mode, a clean sans-serif layout is shown. */
+            /* Under handwritten mode, ruled paper styles apply. */
             .pdf-mock-page.handwritten-mode-active .notebook-page {
               font-family: 'Kalam', cursive;
               font-size: 1.1rem;
@@ -1095,7 +1195,7 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
               background-image: linear-gradient(#e2e8f0 1px, transparent 1px);
               background-size: 100% 9mm;
               background-position: 0 9mm;
-              padding: 18mm 15mm 18mm 30mm; /* Optimized to line multiples! */
+              padding: 18mm 15mm 18mm 30mm;
             }
             .pdf-mock-page.handwritten-mode-active .notebook-page::before {
               content: '';
@@ -1246,7 +1346,8 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
             .handwritten-mode-active ol li {
               line-height: 9mm !important;
             }
-            /* Synced Academic Table Styling for PDF */
+
+            /* Academic Table Styling for PDF */
             table {
               width: 100%;
               border-collapse: collapse;
@@ -1301,8 +1402,8 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
               background: transparent !important;
             }
 
-            /* Premium Math Spacing */
-            .katex-display {
+            /* Math & Formula Spacing */
+            .katex-display, .formula-block {
               margin: 1rem 0 !important;
               padding: 0.5rem 0 !important;
               background: transparent !important;
@@ -1312,7 +1413,7 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
               break-inside: avoid !important;
             }
 
-            /* Professional Code Block Styling */
+            /* Code Block Styling */
             pre {
               margin: 1rem 0 !important;
               padding: 12px 16px !important;
@@ -1340,13 +1441,6 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
               background: transparent !important;
               padding: 0 !important;
               border-radius: 0 !important;
-            }
-
-            /* Specific styles for Highlight.js */
-            .hljs {
-              background: transparent !important;
-              padding: 0 !important;
-              color: inherit !important;
             }
 
             /* Callout box print break protection */
@@ -1417,7 +1511,6 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
               height: auto !important;
             }
 
-            /* Smart Page Breaking */
             .qa-item {
               page-break-inside: avoid !important;
               break-inside: avoid !important;
@@ -1497,9 +1590,6 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
               background: white;
               padding-left: 0.5rem;
             }
-            .toc-link::after {
-              content: target-counter(attr(href), page);
-            }
 
             /* Logo style */
             .pdf-logo {
@@ -1516,82 +1606,14 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
           </style>
         </head>
         <body>
-          ${watermarkText ? `<div class="watermark-overlay">${watermarkText}</div>` : ''}
+          ${safeWatermark ? `<div class="watermark-overlay">${safeWatermark}</div>` : ''}
           <div id="pdf-content">
-            ${logoUrl ? `<div class="pdf-logo"><img src="${logoUrl}" /></div>` : ''}
-            ${html}
+            ${safeLogoUrl ? `<div class="pdf-logo"><img src="${safeLogoUrl}" /></div>` : ''}
+            ${cleanHtml}
           </div>
-          <script>
-            function markComplete() {
-              if (!document.getElementById('render-complete')) {
-                const marker = document.createElement('div');
-                marker.id = 'render-complete';
-                marker.style.display = 'none';
-                document.body.appendChild(marker);
-              }
-            }
-
-            async function renderEverything() {
-              try {
-                if (typeof hljs !== 'undefined') {
-                  document.querySelectorAll('pre code').forEach((el) => {
-                    try { hljs.highlightElement(el); } catch (e) {}
-                  });
-                }
-                if (typeof renderMathInElement === 'function') {
-                  try {
-                    renderMathInElement(document.getElementById('pdf-content') || document.body, {
-                      delimiters: [
-                        {left: '$$', right: '$$', display: true},
-                        {left: '$', right: '$', display: false}
-                      ],
-                      throwOnError: false
-                    });
-                  } catch (e) {}
-                }
-                if (document.querySelector('.mermaid') && typeof mermaid !== 'undefined') {
-                  try {
-                    await mermaid.run({ querySelector: '.mermaid', suppressErrors: true });
-                  } catch (e) {}
-                }
-              } catch (err) {
-                console.error('Rendering failed', err);
-              } finally {
-                markComplete();
-              }
-            }
-
-            markComplete();
-            renderEverything();
-          </script>
         </body>
         </html>
       `;
-
-      await page.setContent(fullHtml, { waitUntil: 'domcontentloaded', timeout: 15000 });
-      await page.waitForSelector('#render-complete', { timeout: 5000 });
-
-      // Handle Image Quality Optimization and Compression
-      if (imageQuality === 'medium' || imageQuality === 'low') {
-        const scaleMap = { medium: 0.5, low: 0.2 };
-        const quality = scaleMap[imageQuality];
-        await page.evaluate((q) => {
-          const images = document.querySelectorAll('img');
-          for (const img of images) {
-            if (!img.src || img.src.startsWith('data:image/jpeg;base64,')) continue;
-            try {
-              const canvas = document.createElement('canvas');
-              canvas.width = img.naturalWidth || img.width;
-              canvas.height = img.naturalHeight || img.height;
-              const ctx = canvas.getContext('2d');
-              ctx.drawImage(img, 0, 0);
-              img.src = canvas.toDataURL('image/jpeg', q);
-            } catch (e) {
-              console.error('Image optimization failed', e);
-            }
-          }
-        }, quality);
-      }
 
       // Set page format/margin options
       const marginConfig = marginMap[margins] || marginMap.normal;
@@ -1602,30 +1624,48 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
         headerFooterOptions.displayHeaderFooter = true;
         headerFooterOptions.headerTemplate = `
           <div style="font-size: 8px; font-family: sans-serif; width: 100%; display: flex; justify-content: space-between; padding: 0 15mm; color: #94a3b8; box-sizing: border-box;">
-            <span>${headerText ? headerText : ''}</span>
-            <span>${metadata.title || ''}</span>
+            <span>${headerText ? sanitizeHtml(headerText, { allowedTags: [] }) : ''}</span>
+            <span>${metadata.title ? sanitizeHtml(metadata.title, { allowedTags: [] }) : ''}</span>
           </div>
         `;
         headerFooterOptions.footerTemplate = `
           <div style="font-size: 8px; font-family: sans-serif; width: 100%; display: flex; justify-content: space-between; padding: 0 15mm; color: #94a3b8; box-sizing: border-box;">
-            <span>${footerText ? footerText : ''}</span>
+            <span>${footerText ? sanitizeHtml(footerText, { allowedTags: [] }) : ''}</span>
             ${includePageNumbers ? `<span>Page <span class="pageNumber"></span> of <span class="totalPages"></span></span>` : ''}
           </div>
         `;
       }
 
-      let pdfBuffer = await page.pdf({
-        format: 'A4',
-        printBackground: true,
-        margin: marginConfig,
-        ...headerFooterOptions,
-        timeout: 90000
+      // Hard timeout enforcement: 20 seconds maximum execution time
+      const generatePdfTask = (async () => {
+        await page.setContent(fullHtml, { waitUntil: 'load', timeout: 15000 });
+        return await page.pdf({
+          format: 'A4',
+          printBackground: true,
+          margin: marginConfig,
+          ...headerFooterOptions,
+          timeout: 15000
+        });
+      })();
+
+      let timeoutTimer = null;
+      const timeoutTask = new Promise((_, reject) => {
+        timeoutTimer = setTimeout(() => {
+          reject(new Error('TIMEOUT_EXCEEDED'));
+        }, 20000);
       });
+
+      let pdfBuffer;
+      try {
+        pdfBuffer = await Promise.race([generatePdfTask, timeoutTask]);
+      } finally {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+      }
 
       await browser.close();
       browser = null;
 
-      // Now, write PDF metadata natively using pdf-lib!
+      // Write PDF metadata using pdf-lib
       try {
         const { PDFDocument } = require('pdf-lib');
         const pdfDoc = await PDFDocument.load(pdfBuffer);
@@ -1633,9 +1673,10 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
         pdfDoc.setTitle(metadata.title || filename || 'Untitled Note');
         if (metadata.subject) pdfDoc.setSubject(metadata.subject);
         if (metadata.author) pdfDoc.setAuthor(metadata.author);
-        if (metadata.keywords) pdfDoc.setKeywords(metadata.keywords.split(',').map(k => k.trim()));
+        if (metadata.keywords && typeof metadata.keywords === 'string') {
+          pdfDoc.setKeywords(metadata.keywords.split(',').map(k => k.trim()));
+        }
         
-        // Additional properties
         const customProducer = [
           metadata.institutionName,
           metadata.department,
@@ -1650,8 +1691,6 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
         }
         pdfDoc.setCreator('SmartNotes AI');
 
-        // Compression logic: pdf-lib automatically compresses on save unless specified otherwise,
-        // but we can compress PDF objects to reduce sizes.
         const compressedPdfBytes = await pdfDoc.save({
           useObjectStreams: compression !== 'none',
         });
@@ -1661,11 +1700,15 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
       }
 
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename || 'notes'}.pdf"`);
-      res.end(pdfBuffer, 'binary');
+      const safeFilename = (filename || 'notes').replace(/[^a-zA-Z0-9_\-\.]/g, '_');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}.pdf"`);
+      return res.end(pdfBuffer, 'binary');
     } catch (error) {
       console.error(`[Backend] PDF generation failed:`, error.message);
-      res.status(500).json({ error: error.message });
+      if (error.message === 'TIMEOUT_EXCEEDED') {
+        return res.status(504).json({ error: 'Export took too long, try a shorter note or simpler formatting.' });
+      }
+      return res.status(500).json({ error: error.message || 'PDF export failed' });
     } finally {
       if (browser) {
         try { await browser.close(); } catch (e) {}
@@ -1675,6 +1718,7 @@ app.post('/api/generate-pdf', heavyLimiter, async (req, res) => {
     if (uniqueUserDataDir && fs.existsSync(uniqueUserDataDir)) {
       try { fs.rmSync(uniqueUserDataDir, { recursive: true, force: true }); } catch (e) {}
     }
+    isPdfExportInProgress = false;
   }
 });
 

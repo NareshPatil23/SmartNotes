@@ -81,6 +81,7 @@ export default function Workspace({
   const [imageQuality, setImageQuality] = useState('high'); // 'high' | 'medium' | 'low'
   const [compression, setCompression] = useState('none'); // 'none' | 'balanced' | 'maximum'
   const [exportProgress, setExportProgress] = useState('idle'); // 'idle' | 'preparing' | 'rendering' | 'optimizing' | 'exporting' | 'done'
+  const [exportError, setExportError] = useState(null);
   const [exportMetadata, setExportMetadata] = useState({
     title: '',
     subject: '',
@@ -279,10 +280,16 @@ export default function Workspace({
 
   const cancelExportPDF = () => {
     if (exportAbortControllerRef.current) {
-      exportAbortControllerRef.current.abort();
-      setSaveStatus('Export Cancelled');
-      setTimeout(() => setSaveStatus('Saved'), 3000);
+      try {
+        exportAbortControllerRef.current.abort();
+      } catch (_) {}
     }
+    setIsExporting(false);
+    setExportProgress('idle');
+    setExportError(null);
+    setShowExportModal(false);
+    setSaveStatus('Export Cancelled');
+    setTimeout(() => setSaveStatus('Saved'), 3000);
   };
 
   const duplicateIdx = questions.findIndex((q, idx) => 
@@ -1499,56 +1506,37 @@ export default function Workspace({
       `;
 
       if (exportFormat === 'pdf') {
-        setExportProgress('rendering');
-        
-        // Wrap document title block
-        const titleBlock = `
-          <div class="pdf-mock-page ${exportTheme === 'kalam' || isHandwrittenMode ? 'handwritten-mode-active' : ''}">
-            <div class="notebook-page">
-              <h1 class="page-title" style="text-align: center; margin-bottom: 0;">${docTitle}</h1>
-              <div class="title-divider" style="border-bottom: 2px solid #000; width: 60%; margin: 9mm auto 9mm;"></div>
-              ${fullHtml}
-            </div>
-          </div>
-        `;
+        setExportProgress('preparing');
+        setExportError(null);
 
-        const response = await safeApiFetch('/api/generate-pdf', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            html: titleBlock,
-            filename: docTitle || 'notes',
-            isHandwrittenMode: exportTheme === 'kalam' || isHandwrittenMode,
-            theme: exportTheme,
-            fontFamily: exportFontFamily,
-            fontSize: exportFontSize,
-            lineSpacing: exportLineSpacing,
-            margins: exportMargins,
-            headerText: exportHeaderText,
-            footerText: exportFooterText,
-            watermarkText: exportWatermarkText,
-            logoUrl: exportLogoUrl,
-            includePageNumbers,
-            metadata: exportMetadata,
-            imageQuality,
-            compression
-          }),
-          signal: exportAbortControllerRef.current.signal
+        // Client-side PDF Generation with embedded selectable vector text (Zero Render Server RAM)
+        const { generateClientPDF } = await import('../../utils/pdfExportEngine');
+
+        await generateClientPDF({
+          docTitle: docTitle || 'notes',
+          questions: filteredQuestions,
+          exportScope,
+          selectedSections,
+          autoNumbering,
+          includeTOC,
+          exportTheme,
+          exportFontFamily,
+          exportFontSize,
+          exportLineSpacing,
+          exportMargins,
+          exportHeaderText,
+          exportFooterText,
+          exportWatermarkText,
+          exportLogoUrl,
+          includePageNumbers,
+          exportMetadata,
+          isHandwrittenMode: exportTheme === 'kalam' || isHandwrittenMode,
+          signal: exportAbortControllerRef.current?.signal,
+          onProgress: (status) => {
+            setExportProgress(status);
+          }
         });
 
-        if (!response.ok) throw new Error("Export failed");
-
-        setExportProgress('optimizing');
-        const blob = await response.blob();
-        
-        setExportProgress('exporting');
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${docTitle || 'notes'}.pdf`;
-        a.click();
-        
-        setExportProgress('done');
         setDrafts(prev => {
           const existingIdx = prev.findIndex(d => d.id === currentNoteId);
           if (existingIdx >= 0) {
@@ -1688,14 +1676,18 @@ export default function Workspace({
     } catch (error) {
       if (error.name === 'AbortError') {
         console.log("Export cancelled by user.");
-      } else {
-        const errMsg = (error.message || '').toLowerCase();
-        if (errMsg.includes('fetch') || errMsg.includes('network') || errMsg.includes('connect')) {
-          alert("Export failed: Unable to connect to backend server. Please ensure the backend server is running on port 3002.");
-        } else {
-          alert("Export failed: " + (error.message || 'Server error'));
-        }
+        setIsExporting(false);
+        setExportProgress('idle');
+        setExportError(null);
+        return;
       }
+      const rawMsg = error.message || '';
+      let friendlyMsg = rawMsg;
+      const lower = rawMsg.toLowerCase();
+      if (lower.includes('fetch') || lower.includes('network') || lower.includes('failed to fetch') || lower.includes('connect')) {
+        friendlyMsg = "Unable to connect to the backend server. Please check your internet connection or server status.";
+      }
+      setExportError(friendlyMsg);
       setExportProgress('error');
     } finally {
       setIsExporting(false);
@@ -1711,6 +1703,8 @@ export default function Workspace({
       title: prev.title || docTitle || 'Untitled Note'
     }));
     setShowExportModal(true);
+    // Pre-fetch selected font in background only when export dialog is opened
+    import('../../utils/pdfExportEngine').then(m => m.prefetchFont(exportFontFamily)).catch(() => {});
   };
 
   const renderSidebar = () => {
@@ -4517,11 +4511,11 @@ export default function Workspace({
                 
                 <p style={{ color: '#64748b', fontSize: '0.9rem', marginBottom: '2rem' }}>
                   {exportProgress === 'preparing' && 'Formatting sections and setting outlines...'}
-                  {exportProgress === 'rendering' && 'Generating PDF canvas via Puppeteer engine...'}
+                  {exportProgress === 'rendering' && 'Embedding fonts and formatting vector pages...'}
                   {exportProgress === 'optimizing' && 'Downscaling images and injecting PDF metadata tags...'}
                   {exportProgress === 'exporting' && 'Please wait while the download starts.'}
                   {exportProgress === 'done' && 'Your notes have been successfully exported.'}
-                  {exportProgress === 'error' && 'An unexpected error occurred during export.'}
+                  {exportProgress === 'error' && (exportError || 'An unexpected error occurred during export.')}
                 </p>
 
                 {exportProgress !== 'done' && exportProgress !== 'error' && (
@@ -4529,7 +4523,7 @@ export default function Workspace({
                 )}
 
                 {(exportProgress === 'done' || exportProgress === 'error') && (
-                  <button className="btn-primary" onClick={() => { setShowExportModal(false); setExportProgress('idle'); }}>Close</button>
+                  <button className="btn-primary" onClick={() => { setShowExportModal(false); setExportProgress('idle'); setExportError(null); }}>Close</button>
                 )}
               </div>
             ) : (
@@ -4622,7 +4616,11 @@ export default function Workspace({
                           
                           <div className="export-field-group">
                             <label className="export-label">Font Family</label>
-                            <select className="export-select" value={exportFontFamily} onChange={e => setExportFontFamily(e.target.value)}>
+                            <select className="export-select" value={exportFontFamily} onChange={e => {
+                              const val = e.target.value;
+                              setExportFontFamily(val);
+                              import('../../utils/pdfExportEngine').then(m => m.prefetchFont(val)).catch(() => {});
+                            }}>
                               <option value="Inter">Inter (Sans-Serif)</option>
                               <option value="Roboto">Roboto (Clean)</option>
                               <option value="Outfit">Outfit (Geometric)</option>

@@ -26,6 +26,8 @@ frontend/.env.*
 *.log
 logs/
 scratch/
+.cache/
+backend/.cache/
 
 # IDE & OS
 .vscode/
