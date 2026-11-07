@@ -320,14 +320,20 @@ export default function Workspace({
     const promises = [];
     if (!window.hljs) {
       promises.push(
-        import('highlight.js').then((m) => {
+        Promise.all([
+          import('highlight.js'),
+          import('highlight.js/styles/github.css')
+        ]).then(([m]) => {
           window.hljs = m.default || m;
         })
       );
     }
     if (!window.renderMathInElement) {
       promises.push(
-        import('katex/dist/contrib/auto-render.mjs').then((m) => {
+        Promise.all([
+          import('katex/dist/contrib/auto-render.mjs'),
+          import('katex/dist/katex.min.css')
+        ]).then(([m]) => {
           window.renderMathInElement = m.default || m;
         })
       );
@@ -336,17 +342,6 @@ export default function Workspace({
       await Promise.all(promises);
     }
   }, []);
-
-  useEffect(() => {
-    if (isHandwrittenMode) {
-      if (!document.querySelector('link[href*="Caveat"]')) {
-        const link = document.createElement('link');
-        link.rel = 'stylesheet';
-        link.href = 'https://fonts.googleapis.com/css2?family=Caveat:wght@400;700&family=Kalam:wght@400;700&display=swap';
-        document.head.appendChild(link);
-      }
-    }
-  }, [isHandwrittenMode]);
 
   const renderContentExtensions = useCallback(async () => {
     await ensurePreviewLibraries();
@@ -1460,7 +1455,7 @@ export default function Workspace({
       let failedStep = 'importing';
       if (errMsgLower.includes('fetch') || errMsgLower.includes('network') || errMsgLower.includes('connect') || errMsgLower.includes('refused')) {
         failedStep = 'importing';
-      } else if (errMsgLower.includes('timeout') || errMsgLower.includes('chrome') || errMsgLower.includes('puppeteer') || errMsgLower.includes('scra') || errMsgLower.includes('extract') || errMsgLower.includes('download')) {
+      } else if (errMsgLower.includes('timeout') || errMsgLower.includes('chrome') || errMsgLower.includes('render') || errMsgLower.includes('scra') || errMsgLower.includes('extract') || errMsgLower.includes('download')) {
         failedStep = 'extracting';
       } else if (errMsgLower.includes('gemini') || errMsgLower.includes('quota') || errMsgLower.includes('key') || errMsgLower.includes('json') || errMsgLower.includes('ai') || errMsgLower.includes('model') || errMsgLower.includes('format')) {
         failedStep = 'formatting';

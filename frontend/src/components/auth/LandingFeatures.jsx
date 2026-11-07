@@ -37,7 +37,7 @@ export default function LandingFeatures() {
 
           <div className="feature-item">
             <div className="feature-icon">🖨️</div>
-            <h3>Puppeteer PDF Export</h3>
+            <h3>Academic Vector PDF Export</h3>
             <p>One-click export into crisp, beautifully typeset academic PDFs with custom headers, footers, watermarks, and TOC.</p>
           </div>
 

@@ -5,8 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "build": "npx puppeteer browsers install chrome",
-    "postinstall": "puppeteer browsers install chrome || true",
+    "build": "echo Backend build successful",
     "migrate": "node scripts/migrate-neon.js",
     "dev": "node --watch --watch-path=index.js index.js"
   },
@@ -27,7 +26,6 @@
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.1",
     "pg": "^8.23.0",
-    "puppeteer": "^24.43.0",
     "sanitize-html": "^2.18.1"
   },
   "optionalDependencies": {
@@ -41,8 +39,6 @@
     "ip-address": "^10.7.5",
     "js-yaml": "^4.3.2",
     "@xmldom/xmldom": "^0.8.15",
-    "qs": "^6.16.2",
-    "basic-ftp": "^6.2.6",
-    "zod": "^3.24.4"
+    "qs": "^6.16.2"
   }
 }
