@@ -33,6 +33,13 @@ const { optionalAuth, requireAuth } = require('./src/middleware/auth');
 const { apiLimiter, authLimiter, aiLimiter, heavyLimiter, validateSsrfUrl } = require('./src/middleware/security');
 const { resolveAIClient } = require('./src/services/aiService');
 const { checkCanGenerate, recordGeneration } = require('./src/services/usageService');
+const { extractLinkContent } = require('./src/services/linkExtractorService');
+const {
+  ControlledAiShareError,
+  validateAiShareUrl,
+  fetchAndParseAiShareLink,
+  parsePastedChatText
+} = require('./src/services/aiChatShareService');
 const sanitizeHtml = require('sanitize-html');
 
 // Routers
@@ -684,17 +691,26 @@ app.post('/api/format-ai', aiLimiter, async (req, res) => {
   }
 });
 
-// Endpoint to scrape and import content from a public link
-app.post('/api/import-link', aiLimiter, heavyLimiter, async (req, res) => {
+// Endpoint to scrape and import content from a public link using lightweight HTTP + Readability
+app.post('/api/import-link', requireAuth, aiLimiter, heavyLimiter, async (req, res) => {
   const { url } = req.body;
-  if (!url) {
-    return res.status(400).json({ error: 'No URL provided' });
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'Please provide a valid URL link.' });
   }
 
+  let extracted;
   try {
-    await validateSsrfUrl(url);
-  } catch (err) {
-    return res.status(400).json({ error: `Security check: ${err.message}` });
+    extracted = await extractLinkContent(url.trim());
+  } catch (extractErr) {
+    console.warn(`[Backend] Link extraction failed for ${url}:`, extractErr.message);
+    return res.status(400).json({ error: extractErr.message });
+  }
+
+  const { title, text: contentText } = extracted;
+  if (!contentText || contentText.trim().length === 0) {
+    return res.status(400).json({
+      error: 'Could not extract readable article text from this page. Please copy the text and paste it into the editor instead.'
+    });
   }
 
   let reqGenAI = null;
@@ -705,210 +721,132 @@ app.post('/api/import-link', aiLimiter, heavyLimiter, async (req, res) => {
     reqGenAI = null;
   }
 
-  let browser = null;
-  let contentText = '';
-  let isPdf = false;
+  // In BYOK architecture, if backend has no Gemini API key, return the extracted text
+  // so the client can format it directly using the user's browser-stored Gemini key.
+  if (!reqGenAI) {
+    console.log(`[Backend] Extracted ${contentText.length} chars. No server Gemini key; returning text for client-side BYOK formatting.`);
+    return res.json({ success: true, title, text: contentText });
+  }
+
+  console.log(`[Backend] Extracted ${contentText.length} chars. Passing to Gemini AI...`);
+
+  const preferredModel = req.headers['x-gemini-model'];
+  const modelsToTry = [];
+  if (preferredModel && preferredModel.trim()) {
+    modelsToTry.push(preferredModel.trim());
+  }
+  const defaultModels = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3.1-flash-lite"
+  ];
+  for (const model of defaultModels) {
+    if (!modelsToTry.includes(model)) {
+      modelsToTry.push(model);
+    }
+  }
+
+  const systemPrompt = `
+    You are an expert academic text-to-HTML formatting tool. Your task is to extract content from the provided source page and convert it into a beautifully structured, premium educational Q&A notes format.
+
+    STRICT FORMAT RULES:
+    1. Extract all relevant educational information, definitions, code blocks, lists, equations, and tables. Strip navigation menus, advertisements, and header/footer elements.
+    2. Group content logically into separate Question and Answer elements. For example, make a question "Describe the main structure of [topic]?" or "What is the function of [concept]?" followed by a detailed structured answer.
+    3. Automatically estimate logical exam-style "marks" (e.g. 2, 5, 10) for each question block.
+
+    TAG PRESERVATION RULES:
+    Inside the HTML "answer" field, you must preserve and format:
+    - Headings: Use <h2> and <h3> headings.
+    - Emphasis: Use <strong> and <mark> for terms.
+    - Lists: Use <ul> and <li> for lists.
+    - Code Blocks: Wrap programming code in <pre><code class="language-[lang]">[code]</code></pre> tags. Replace [lang] with the actual language (e.g. sql, python, javascript).
+    - Tables: Convert grids, truth tables, or data matrixes into clean <table>, <th>, and <td> structures.
+    - Images: Preserve images. Keep <img> tags exactly as they appear in the source HTML, retaining their absolute URLs.
+    - Hyperlinks: Keep <a href="...">...</a> tags, preserving the absolute URL.
+    - Diagrams: Auto-detect flowcharts or text diagrams and output them inside <div class="mermaid">...</div> blocks using Mermaid syntax.
+    - Math: Use $$ ... $$ for display math and $ ... $ for inline math.
+
+    OUTPUT FORMAT:
+    Return ONLY a JSON array of objects: [{ "question": "...", "answer": "...", "marks": "..." }]
+    Ensure you output only raw JSON. Do not wrap in markdown tags like \`\`\`json.
+  `;
+
+  let lastError = null;
+  for (const modelName of modelsToTry) {
+    try {
+      console.log(`[Backend] Formatting import using Gemini model: ${modelName}`);
+      const model = reqGenAI.getGenerativeModel({
+        model: modelName,
+        generationConfig: { responseMimeType: "application/json" }
+      });
+      const result = await model.generateContent([
+        `SOURCE LINK URL: ${url}\n\nCONTENT EXTRACTED:\n${contentText.substring(0, 150000)}`,
+        systemPrompt
+      ], { timeout: 300000 });
+      const response = await result.response;
+      let text = response.text().trim();
+      text = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+      const qaPairs = cleanAndParseJson(text);
+      
+      console.log(`[Backend] Extracted content converted to ${qaPairs.length} questions successfully.`);
+      return res.json({ success: true, title, text: contentText, qaList: qaPairs });
+    } catch (err) {
+      console.warn(`[Backend] Model ${modelName} failed link import processing:`, err.message);
+      lastError = err;
+    }
+  }
+
+  // Graceful fallback: return the extracted text if AI formatting fails
+  console.log(`[Backend] AI formatting failed (${lastError?.message}), returning raw extracted text as fallback.`);
+  return res.json({ success: true, title, text: contentText });
+});
+
+// Endpoint to inspect and parse an AI chat share link or pasted text into selectable turns
+app.post('/api/import-ai-share', requireAuth, aiLimiter, heavyLimiter, async (req, res) => {
+  const { url, rawText } = req.body;
+
+  // Handle pasted chat text fallback
+  if (rawText && typeof rawText === 'string') {
+    try {
+      const turns = parsePastedChatText(rawText);
+      if (!turns || turns.length === 0) {
+        return res.status(400).json({ error: 'Could not detect any question/answer turns in the pasted text.' });
+      }
+      return res.json({
+        success: true,
+        title: 'Pasted AI Conversation',
+        provider: 'custom',
+        turns
+      });
+    } catch (err) {
+      if (err && err.isControlled) {
+        return res.status(400).json({ error: err.message });
+      }
+      return res.status(400).json({ error: 'Failed to parse pasted dialogue. Please check the text format.' });
+    }
+  }
+
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'Please provide a valid AI chat share link.' });
+  }
 
   try {
-    // Check if the URL resolves directly to a PDF
-    try {
-      const headRes = await fetch(url, { method: 'HEAD', timeout: 5000 });
-      const hContentType = headRes.headers.get('content-type') || '';
-      if (hContentType.toLowerCase().includes('application/pdf')) {
-        isPdf = true;
-      }
-    } catch (e) {
-      console.warn('[Backend] HEAD request failed, falling back to path check:', e.message);
+    const result = await fetchAndParseAiShareLink(url.trim());
+    return res.json({
+      success: true,
+      title: result.title,
+      provider: result.provider,
+      turns: result.turns
+    });
+  } catch (err) {
+    // Privacy: zero logging of URL or conversation content
+    // Only return controlled friendly messages; unexpected errors receive a safe generic message
+    if (err && err.isControlled) {
+      return res.status(400).json({ error: err.message });
     }
-
-    if (!isPdf && url.toLowerCase().split('?')[0].endsWith('.pdf')) {
-      isPdf = true;
-    }
-
-    if (isPdf) {
-      console.log(`[Backend] Direct PDF URL detected: ${url}`);
-      const pdfRes = await fetch(url);
-      if (!pdfRes.ok) {
-        throw new Error(`Failed to download PDF from link. Status: ${pdfRes.status}`);
-      }
-      const buffer = await pdfRes.arrayBuffer();
-      const pdfData = await pdf(Buffer.from(buffer));
-      contentText = pdfData.text.trim();
-      if (!contentText) {
-        throw new Error('PDF contains no extractable text content.');
-      }
-    } else if (url.toLowerCase().split('?')[0].endsWith('.txt') || url.toLowerCase().split('?')[0].endsWith('.md')) {
-      console.log(`[Backend] Text/Markdown URL detected: ${url}`);
-      const txtRes = await fetch(url);
-      if (!txtRes.ok) {
-        throw new Error(`Failed to download text/markdown file. Status: ${txtRes.status}`);
-      }
-      contentText = await txtRes.text();
-    } else {
-      console.log(`[Backend] Webpage URL detected, extracting content from: ${url}`);
-      const uniqueUserDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'puppeteer-import-'));
-      let puppeteerSucceeded = false;
-
-      try {
-        const systemBrowser = getSystemBrowserExecutable();
-        const launchOptions = {
-          headless: true,
-          userDataDir: uniqueUserDataDir,
-          args: ['--no-sandbox', '--disable-setuid-sandbox']
-        };
-        if (systemBrowser) {
-          launchOptions.executablePath = systemBrowser;
-        }
-
-        browser = await puppeteer.launch(launchOptions);
-        const page = await browser.newPage();
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
-        
-        await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
-        
-        // Handle known dynamic sites
-        if (url.includes('chatgpt.com/share') || url.includes('chat.openai.com/share')) {
-          await page.waitForSelector('.flex.flex-col.items-start', { timeout: 10000 }).catch(() => {});
-        } else if (url.includes('docs.google.com')) {
-          await page.waitForSelector('.kix-page-content-wrapper, body', { timeout: 15000 }).catch(() => {});
-        } else if (url.includes('notion.so') || url.includes('notion.site')) {
-          await page.waitForSelector('.notion-page-content, body', { timeout: 15000 }).catch(() => {});
-        }
-
-        // Extract cleaned text and HTML
-        contentText = await page.evaluate(() => {
-          const removals = document.querySelectorAll('script, style, iframe, nav, header, footer, noscript, svg');
-          removals.forEach(el => el.remove());
-          const mainContent = document.querySelector('article') || document.querySelector('main') || document.body;
-          return mainContent ? (mainContent.innerText || mainContent.innerHTML) : '';
-        });
-
-        await browser.close();
-        browser = null;
-        puppeteerSucceeded = !!(contentText && contentText.trim().length > 0);
-      } catch (browserErr) {
-        console.warn(`[Backend] Puppeteer launch/extract failed (${browserErr.message}). Falling back to HTTP fetch extraction.`);
-      } finally {
-        if (browser) {
-          try { await browser.close(); } catch (e) {}
-          browser = null;
-        }
-        if (uniqueUserDataDir && fs.existsSync(uniqueUserDataDir)) {
-          try { fs.rmSync(uniqueUserDataDir, { recursive: true, force: true }); } catch (e) {}
-        }
-      }
-
-      // If Puppeteer could not run or extracted empty text, fallback to standard fetch
-      if (!puppeteerSucceeded) {
-        console.log(`[Backend] Using resilient HTTP fetch for link: ${url}`);
-        const pageRes = await fetch(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-          }
-        });
-        if (!pageRes.ok) {
-          throw new Error(`Failed to load URL content (HTTP ${pageRes.status}: ${pageRes.statusText})`);
-        }
-        const rawHtml = await pageRes.text();
-        contentText = rawHtml
-          .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-          .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
-          .replace(/<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>/gi, '')
-          .replace(/<header\b[^<]*(?:(?!<\/header>)<[^<]*)*<\/header>/gi, '')
-          .replace(/<nav\b[^<]*(?:(?!<\/nav>)<[^<]*)*<\/nav>/gi, '')
-          .replace(/<footer\b[^<]*(?:(?!<\/footer>)<[^<]*)*<\/footer>/gi, '')
-          .replace(/<[^>]+>/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim();
-      }
-    }
-
-    if (!contentText || contentText.trim().length === 0) {
-      throw new Error('Unable to extract readable content from the provided URL.');
-    }
-
-    // In BYOK architecture, if backend has no Gemini API key, return the scraped text
-    // so the client can format it directly using the user's browser-stored Gemini key.
-    if (!reqGenAI) {
-      console.log(`[Backend] Extracted ${contentText.length} chars. No server Gemini key; returning text for client-side BYOK formatting.`);
-      return res.json({ success: true, text: contentText });
-    }
-
-    console.log(`[Backend] Extracted ${contentText.length} chars. Passing to Gemini AI...`);
-
-    const preferredModel = req.headers['x-gemini-model'];
-    const modelsToTry = [];
-    if (preferredModel && preferredModel.trim()) {
-      modelsToTry.push(preferredModel.trim());
-    }
-    const defaultModels = [
-      "gemini-2.5-flash",
-      "gemini-2.5-flash-lite",
-      "gemini-3.1-flash-lite"
-    ];
-    for (const model of defaultModels) {
-      if (!modelsToTry.includes(model)) {
-        modelsToTry.push(model);
-      }
-    }
-
-    const systemPrompt = `
-      You are an expert academic text-to-HTML formatting tool. Your task is to extract content from the provided source page and convert it into a beautifully structured, premium educational Q&A notes format.
-
-      STRICT FORMAT RULES:
-      1. Extract all relevant educational information, definitions, code blocks, lists, equations, and tables. Strip navigation menus, advertisements, and header/footer elements.
-      2. Group content logically into separate Question and Answer elements. For example, make a question "Describe the main structure of [topic]?" or "What is the function of [concept]?" followed by a detailed structured answer.
-      3. Automatically estimate logical exam-style "marks" (e.g. 2, 5, 10) for each question block.
-
-      TAG PRESERVATION RULES:
-      Inside the HTML "answer" field, you must preserve and format:
-      - Headings: Use <h2> and <h3> headings.
-      - Emphasis: Use <strong> and <mark> for terms.
-      - Lists: Use <ul> and <li> for lists.
-      - Code Blocks: Wrap programming code in <pre><code class="language-[lang]">[code]</code></pre> tags. Replace [lang] with the actual language (e.g. sql, python, javascript).
-      - Tables: Convert grids, truth tables, or data matrixes into clean <table>, <th>, and <td> structures.
-      - Images: Preserve images. Keep <img> tags exactly as they appear in the source HTML, retaining their absolute URLs.
-      - Hyperlinks: Keep <a href="...">...</a> tags, preserving the absolute URL.
-      - Diagrams: Auto-detect flowcharts or text diagrams and output them inside <div class="mermaid">...</div> blocks using Mermaid syntax.
-      - Math: Use $$ ... $$ for display math and $ ... $ for inline math.
-
-      OUTPUT FORMAT:
-      Return ONLY a JSON array of objects: [{ "question": "...", "answer": "...", "marks": "..." }]
-      Ensure you output only raw JSON. Do not wrap in markdown tags like \`\`\`json.
-    `;
-
-    let lastError = null;
-    for (const modelName of modelsToTry) {
-      try {
-        console.log(`[Backend] Scraping import using Gemini model: ${modelName}`);
-        const model = reqGenAI.getGenerativeModel({
-          model: modelName,
-          generationConfig: { responseMimeType: "application/json" }
-        });
-        const result = await model.generateContent([
-          `SOURCE LINK URL: ${url}\n\nCONTENT EXTRACTED:\n${contentText.substring(0, 150000)}`,
-          systemPrompt
-        ], { timeout: 300000 });
-        const response = await result.response;
-        let text = response.text().trim();
-        text = text.replace(/```json/gi, '').replace(/```/g, '').trim();
-        const qaPairs = cleanAndParseJson(text);
-        
-        console.log(`[Backend] Scraped content converted to ${qaPairs.length} questions successfully.`);
-        return res.json({ success: true, qaList: qaPairs });
-      } catch (err) {
-        console.warn(`[Backend] Model ${modelName} failed link import processing:`, err.message);
-        lastError = err;
-      }
-    }
-    throw new Error(lastError?.message || "AI model execution failed.");
-  } catch (error) {
-    if (browser) {
-      try { await browser.close(); } catch (e) {}
-    }
-    console.error(`[Backend] Extraction failed:`, error.message);
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({
+      error: 'Unable to process this AI chat link at this time. Please use "Paste chat text" or "Upload export file" instead.'
+    });
   }
 });
 

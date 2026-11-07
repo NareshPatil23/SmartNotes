@@ -1,12 +1,22 @@
-const rateLimit = require('express-rate-limit');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const dns = require('dns').promises;
+const { validateUrlSafe, isRestrictedIp } = require('../services/linkExtractorService');
+
+// User-aware rate limit key generator (falls back to client IP)
+const userOrIpKeyGenerator = (req) => {
+  if (req.user && req.user.id) {
+    return `usr_${req.user.id}`;
+  }
+  return ipKeyGenerator(req.ip);
+};
 
 // General API rate limiter
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 300, // 300 requests per IP per window
+  max: 300, // 300 requests per user/IP per window
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: userOrIpKeyGenerator,
   message: { error: 'Too many requests, please try again later.' }
 });
 
@@ -16,6 +26,7 @@ const heavyLimiter = rateLimit({
   max: 20, // 20 requests per minute
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: userOrIpKeyGenerator,
   message: { error: 'Rate limit exceeded for heavy tasks. Please wait a moment.' }
 });
 
@@ -44,42 +55,7 @@ function isPrivateIp(ip) {
  * Validates a target URL against SSRF threats
  */
 async function validateSsrfUrl(urlString) {
-  let parsed;
-  try {
-    parsed = new URL(urlString);
-  } catch (e) {
-    throw new Error('Invalid URL format');
-  }
-
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('Only HTTP and HTTPS URLs are allowed');
-  }
-
-  const hostname = parsed.hostname.toLowerCase();
-
-  if (
-    hostname === 'localhost' ||
-    hostname.endsWith('.local') ||
-    hostname.endsWith('.internal') ||
-    hostname === '169.254.169.254'
-  ) {
-    throw new Error('Access to internal network addresses is prohibited');
-  }
-
-  // Resolve hostname to IP to prevent DNS rebinding attacks
-  try {
-    const addresses = await dns.lookup(hostname, { all: true });
-    for (const addr of addresses) {
-      if (isPrivateIp(addr.address)) {
-        throw new Error('Access to private or local network addresses is prohibited');
-      }
-    }
-  } catch (err) {
-    if (err.message.includes('prohibited')) throw err;
-    throw new Error(`Unable to resolve host: ${hostname}`);
-  }
-
-  return true;
+  return await validateUrlSafe(urlString);
 }
 
 // Auth/Login rate limiter (prevent brute force / credential stuffing)
@@ -97,6 +73,7 @@ const aiLimiter = rateLimit({
   max: 20, // 20 requests per minute
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: userOrIpKeyGenerator,
   message: { error: 'Too many AI generation requests. Please wait a minute before trying again.' }
 });
 

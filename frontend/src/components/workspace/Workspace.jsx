@@ -16,6 +16,7 @@ import {
   generateGeminiContent,
   DEFAULT_MODEL
 } from '../../services/geminiClient'
+import AiChatImportModal from './AiChatImportModal'
 
 const RichEditor = lazy(() => import('../RichEditor'))
 const AuthModal = lazy(() => import('../auth/AuthModal'))
@@ -57,6 +58,7 @@ export default function Workspace({
   
   // Link Import States
   const [showImportModal, setShowImportModal] = useState(false);
+  const [showAiChatModal, setShowAiChatModal] = useState(false);
   const [importUrl, setImportUrl] = useState('');
   const [importProgress, setImportProgress] = useState('idle'); // 'idle' | 'importing' | 'extracting' | 'formatting' | 'previewing' | 'done' | 'error'
   const [importError, setImportError] = useState('');
@@ -277,6 +279,8 @@ export default function Workspace({
   const richEditorRef = useRef(null)
   const previewRef = useRef(null)
   const exportAbortControllerRef = useRef(null)
+  const importAbortControllerRef = useRef(null)
+  const [isImportWakingUp, setIsImportWakingUp] = useState(false)
 
   const cancelExportPDF = () => {
     if (exportAbortControllerRef.current) {
@@ -290,6 +294,18 @@ export default function Workspace({
     setShowExportModal(false);
     setSaveStatus('Export Cancelled');
     setTimeout(() => setSaveStatus('Saved'), 3000);
+  };
+
+  const cancelImportLink = () => {
+    if (importAbortControllerRef.current) {
+      try {
+        importAbortControllerRef.current.abort();
+      } catch (_) {}
+    }
+    setIsImportWakingUp(false);
+    setImportProgress('idle');
+    setImportError('');
+    setShowImportModal(false);
   };
 
   const duplicateIdx = questions.findIndex((q, idx) => 
@@ -1314,18 +1330,72 @@ export default function Workspace({
     return text.replace(/\n{3,}/g, '\n\n').trim();
   };
 
+  const handleImportAiTurns = ({ title, turns }) => {
+    if (!turns || turns.length === 0) return;
+
+    const importedQuestions = turns.map((turn, index) => {
+      const cleanQuestion = DOMPurify.sanitize(turn.question || '', { ALLOWED_TAGS: [] });
+      let formattedAnswer = DOMPurify.sanitize(turn.answer || '', {
+        ALLOWED_TAGS: [
+          'p', 'br', 'strong', 'em', 'u', 's', 'code', 'pre', 'blockquote',
+          'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'table', 'thead', 'tbody',
+          'tr', 'th', 'td', 'mark', 'hr'
+        ],
+        ALLOWED_ATTR: ['class', 'style', 'align']
+      });
+      if (!formattedAnswer.startsWith('<')) {
+        formattedAnswer = '<p>' + formattedAnswer.replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br/>') + '</p>';
+      }
+      return {
+        number: questions.length + index + 1,
+        question: cleanQuestion,
+        answer: formattedAnswer,
+        marks: '5'
+      };
+    });
+
+    if (questions.length === 0 && docTitle === 'Untitled Note') {
+      setDocTitle(title || 'Imported AI Chat Notes');
+    }
+
+    setQuestions(prev => [...prev, ...importedQuestions]);
+    setQuestionNumber(prev => prev + importedQuestions.length);
+    setSaveStatus(`Imported ${importedQuestions.length} turns from AI chat`);
+    setTimeout(() => setSaveStatus('Saved'), 3500);
+  };
+
   const handleImportLink = async (e) => {
     if (e) e.preventDefault();
     if (!importUrl.trim()) return;
 
+    const trimmed = importUrl.trim();
+    if (
+      trimmed.includes('chatgpt.com/share') ||
+      trimmed.includes('chat.openai.com/share') ||
+      trimmed.includes('claude.ai/share')
+    ) {
+      setShowImportModal(false);
+      setShowAiChatModal(true);
+      return;
+    }
+
     setImportProgress('importing');
     setImportFailedStep(null);
     setImportError('');
+    setIsImportWakingUp(false);
+
+    importAbortControllerRef.current = new AbortController();
 
     let extractTimer;
     let formatTimer;
+    let wakeUpTimer;
 
     try {
+      // Free-tier cold start indicator timer
+      wakeUpTimer = setTimeout(() => {
+        setIsImportWakingUp(true);
+      }, 4000);
+
       // Step 2 transition
       extractTimer = setTimeout(() => {
         setImportProgress(prev => prev === 'importing' ? 'extracting' : prev);
@@ -1338,6 +1408,9 @@ export default function Workspace({
 
       const key = getStoredApiKey();
       if (!key) {
+        clearTimeout(wakeUpTimer);
+        clearTimeout(extractTimer);
+        clearTimeout(formatTimer);
         setShowKeyModal(true);
         setImportProgress('idle');
         return;
@@ -1348,15 +1421,18 @@ export default function Workspace({
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ url: importUrl })
+        body: JSON.stringify({ url: importUrl }),
+        signal: importAbortControllerRef.current.signal
       });
 
+      clearTimeout(wakeUpTimer);
       clearTimeout(extractTimer);
       clearTimeout(formatTimer);
+      setIsImportWakingUp(false);
 
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
-        throw new Error(errData.error || response.statusText || 'Scraping failed.');
+        throw new Error(errData.error || response.statusText || 'Unable to import content from this link.');
       }
 
       setImportProgress('formatting');
@@ -1406,13 +1482,23 @@ export default function Workspace({
           setImportProgress('idle');
         }, 1500);
       } else {
-        throw new Error('No Q&A blocks were extracted from this link.');
+        throw new Error('No readable content could be extracted from this link. Please copy and paste the text instead.');
       }
     } catch (err) {
-      console.error('[Import Link Error]', err);
+      clearTimeout(wakeUpTimer);
       clearTimeout(extractTimer);
       clearTimeout(formatTimer);
-      const errMsg = err.message || 'An error occurred during link import.';
+      setIsImportWakingUp(false);
+
+      if (err.name === 'AbortError') {
+        console.log('[Import Link] Operation cancelled by user.');
+        setImportProgress('idle');
+        setImportError('');
+        return;
+      }
+
+      console.error('[Import Link Error]', err);
+      const errMsg = err.message || 'An error occurred during link import. Please copy and paste the text instead.';
       setImportError(errMsg);
       
       const errMsgLower = errMsg.toLowerCase();
@@ -4363,13 +4449,13 @@ export default function Workspace({
           <div className="modal-card" style={{ maxWidth: '480px' }}>
             <div className="modal-header">
               <h2>Import via Link</h2>
-              <button className="modal-close-btn" onClick={() => setShowImportModal(false)}>×</button>
+              <button className="modal-close-btn" onClick={cancelImportLink}>×</button>
             </div>
             <div className="modal-body">
               {importProgress === 'idle' ? (
                 <form onSubmit={handleImportLink}>
                   <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
-                    Paste a link to a PDF, text file, ChatGPT shared link, Google Doc, Notion public page, or article.
+                    Paste a link to a public article, blog post, documentation page, or PDF link.
                   </p>
                   <div className="export-field-group">
                     <label className="export-label">URL Link</label>
@@ -4377,14 +4463,31 @@ export default function Workspace({
                       type="url" 
                       required 
                       className="export-input" 
-                      placeholder="https://example.com/document.pdf"
+                      placeholder="https://example.com/article"
                       value={importUrl}
                       onChange={(e) => setImportUrl(e.target.value)}
                     />
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1.5rem' }}>
-                    <button type="button" className="btn-secondary" onClick={() => setShowImportModal(false)}>Cancel</button>
+                    <button type="button" className="btn-secondary" onClick={cancelImportLink}>Cancel</button>
                     <button type="submit" className="btn-primary">Import</button>
+                  </div>
+                  <div style={{ marginTop: '1rem', paddingTop: '0.75rem', borderTop: '1px solid #f1f5f9', textAlign: 'center' }}>
+                    <button
+                      type="button"
+                      onClick={() => { setShowImportModal(false); setShowAiChatModal(true); }}
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        color: '#0284c7',
+                        fontSize: '0.82rem',
+                        cursor: 'pointer',
+                        textDecoration: 'underline',
+                        padding: 0
+                      }}
+                    >
+                      🤖 Importing a ChatGPT conversation? Click here for question picker &amp; fallbacks &rarr;
+                    </button>
                   </div>
                 </form>
               ) : (
@@ -4392,7 +4495,7 @@ export default function Workspace({
                   <div className="progress-list">
                     {(() => {
                       const steps = [
-                        { key: 'importing', label: 'Importing...' },
+                        { key: 'importing', label: 'Connecting & Validating...' },
                         { key: 'extracting', label: 'Extracting Content...' },
                         { key: 'formatting', label: 'Formatting Notes...' },
                         { key: 'previewing', label: 'Generating Preview...' }
@@ -4445,6 +4548,18 @@ export default function Workspace({
                       });
                     })()}
                   </div>
+
+                  {isImportWakingUp && importProgress !== 'done' && importProgress !== 'error' && (
+                    <div style={{ marginTop: '0.75rem', padding: '0.5rem 0.75rem', background: '#eff6ff', border: '1px solid #dbeafe', borderRadius: '6px', fontSize: '0.8rem', color: '#1d4ed8', textAlign: 'center' }}>
+                      ⏳ Connecting to server (Render free tier may take up to ~30s on cold start)...
+                    </div>
+                  )}
+
+                  {importProgress !== 'done' && importProgress !== 'error' && (
+                    <div style={{ display: 'flex', justifyContent: 'center', marginTop: '1.25rem' }}>
+                      <button type="button" className="btn-secondary" onClick={cancelImportLink}>Cancel Import</button>
+                    </div>
+                  )}
                   
                   {importProgress === 'done' && (
                     <div style={{ textAlign: 'center', color: '#10b981', fontWeight: 'bold', marginTop: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
@@ -4454,12 +4569,26 @@ export default function Workspace({
 
                   {importProgress === 'error' && (
                     <div style={{ marginTop: '1rem' }}>
-                      <div style={{ padding: '0.75rem 1rem', background: '#fef2f2', border: '1px solid #fee2e2', borderRadius: '8px', color: '#ef4444', fontSize: '0.85rem', marginBottom: '1rem', wordBreak: 'break-word' }}>
-                        <strong>Error:</strong> {importError || 'An error occurred.'}
+                      <div style={{ padding: '0.75rem 1rem', background: '#fef2f2', border: '1px solid #fee2e2', borderRadius: '8px', color: '#ef4444', fontSize: '0.85rem', marginBottom: '1rem', wordBreak: 'break-word', lineHeight: '1.4' }}>
+                        <strong>Notice:</strong> {importError || 'An error occurred during link import.'}
                       </div>
-                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
-                        <button type="button" className="btn-secondary" onClick={() => { setImportProgress('idle'); setImportError(''); }}>Cancel</button>
-                        <button type="button" className="btn-primary" onClick={(e) => handleImportLink(e)}>Retry</button>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                        <button 
+                          type="button" 
+                          className="btn-secondary" 
+                          style={{ background: '#f8fafc', borderColor: '#cbd5e1', color: '#334155', fontWeight: '500' }} 
+                          onClick={() => { 
+                            cancelImportLink();
+                            setSaveStatus('Ready: Paste copied text into your notes');
+                            setTimeout(() => setSaveStatus('Saved'), 4000);
+                          }}
+                        >
+                          📋 Paste the text instead
+                        </button>
+                        <div style={{ display: 'flex', gap: '0.5rem' }}>
+                          <button type="button" className="btn-secondary" onClick={cancelImportLink}>Cancel</button>
+                          <button type="button" className="btn-primary" onClick={(e) => handleImportLink(e)}>Retry</button>
+                        </div>
                       </div>
                     </div>
                   )}
@@ -4469,6 +4598,16 @@ export default function Workspace({
           </div>
         </div>
       )}
+
+      <AiChatImportModal
+        isOpen={showAiChatModal}
+        onClose={() => setShowAiChatModal(false)}
+        onImportTurns={handleImportAiTurns}
+        safeApiFetch={safeApiFetch}
+        setSaveStatus={setSaveStatus}
+        getStoredApiKey={getStoredApiKey}
+        setShowKeyModal={setShowKeyModal}
+      />
 
       {showExportModal && (
         <div className="modal-overlay">
