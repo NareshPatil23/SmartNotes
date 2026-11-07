@@ -48,7 +48,7 @@ export default function GeminiKeyModal({ isOpen, onClose, onKeySaved, isRequired
     setErrorMessage('');
     setSuccessMessage('');
 
-    // Requirement 3: Validate the key with a minimal test request before saving
+    // Validate the key with the models list endpoint (no generation quota used)
     const result = await validateGeminiApiKey(cleanKey);
 
     setIsValidating(false);
@@ -60,12 +60,12 @@ export default function GeminiKeyModal({ isOpen, onClose, onKeySaved, isRequired
 
     // Save strictly to browser storage (localStorage or sessionStorage)
     saveApiKey(cleanKey, remember);
-    setSuccessMessage('✓ API Key verified and saved successfully!');
+    setSuccessMessage(result.warning ? `✓ ${result.warning}` : '✓ API Key verified and saved successfully!');
 
     setTimeout(() => {
-      if (onKeySaved) onKeySaved(cleanKey);
+      if (onKeySaved) onKeySaved(cleanKey, result.availableModels);
       onClose();
-    }, 700);
+    }, 800);
   };
 
   return (

@@ -1,3 +1,5 @@
+import { DEFAULT_GEMINI_MODEL } from '../config/geminiConfig.js';
+
 /**
  * Central Authenticated API Service
  */
@@ -157,7 +159,7 @@ export const api = {
     return await safeParseJson(res);
   },
 
-  async testKeyConnection(apiKey = null, model = 'gemini-2.5-flash') {
+  async testKeyConnection(apiKey = null, model = DEFAULT_GEMINI_MODEL) {
     const res = await safeApiFetch('/api/settings/test-key', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

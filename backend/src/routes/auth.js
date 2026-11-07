@@ -5,6 +5,7 @@ const { signToken, requireAuth } = require('../middleware/auth');
 const { authLimiter } = require('../middleware/security');
 const { getUserUsage } = require('../services/usageService');
 const { maskApiKey } = require('../services/encryptionService');
+const { DEFAULT_GEMINI_MODEL } = require('../config/aiConfig');
 
 const router = express.Router();
 
@@ -144,8 +145,8 @@ router.post('/google', authLimiter, async (req, res) => {
       const settingsId = `set_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
       await query(
         `INSERT INTO user_settings (id, user_id, ai_provider, preferred_model, default_theme) 
-         VALUES ($1, $2, 'platform', 'gemini-2.5-flash', 'default')`,
-        [settingsId, userId]
+         VALUES ($1, $2, 'platform', $3, 'default')`,
+        [settingsId, userId, DEFAULT_GEMINI_MODEL]
       );
 
       user = {
@@ -230,7 +231,7 @@ router.get('/me', requireAuth, async (req, res) => {
       },
       settings: {
         aiProvider: settings.ai_provider || 'platform',
-        preferredModel: settings.preferred_model || 'gemini-2.5-flash',
+        preferredModel: settings.preferred_model || DEFAULT_GEMINI_MODEL,
         defaultTheme: settings.default_theme || 'default',
         hasByokKey: !!settings.encrypted_byok_key
       },

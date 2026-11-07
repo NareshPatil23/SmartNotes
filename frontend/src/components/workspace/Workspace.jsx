@@ -14,8 +14,16 @@ import {
   askPdfChatDirect,
   extractNotesDirect,
   generateGeminiContent,
-  DEFAULT_MODEL
+  getPreferredModel,
+  setPreferredModel as savePreferredModelStorage,
+  getAvailableModels
 } from '../../services/geminiClient'
+import {
+  DEFAULT_GEMINI_MODEL,
+  GEMINI_FALLBACK_MODELS,
+  KNOWN_GEMINI_MODELS,
+  resolvePreferredModel
+} from '../../config/geminiConfig'
 import AiChatImportModal from './AiChatImportModal'
 import { formatAnswerWithDiagrams, hydrateMermaidContainers } from '../../utils/mermaidHelper'
 
@@ -153,22 +161,18 @@ export default function Workspace({
   const [askPdfDragging, setAskPdfDragging] = useState(false)
   const askPdfFileInputRef = useRef(null)
 
+  const [availableModelsList, setAvailableModelsList] = useState(() => getAvailableModels());
+  const [preferredModel, setPreferredModel] = useState(() => getPreferredModel());
+
   const [askPdfModel, setAskPdfModel] = useState(() => {
-    const savedModel = localStorage.getItem('smartnotes_gemini_model');
-    return savedModel || 'gemini-3.5-flash';
+    return getPreferredModel();
   });
 
   const getModelLabel = (modelId) => {
-    switch (modelId) {
-      case 'gpt-4o': return 'GPT-4o';
-      case 'gemini-3.5-flash': return 'Gemini 3.5 Flash';
-      case 'gemini-3.1-flash-lite': return 'Gemini 3.1 Flash Lite';
-      case 'gemini-2.5-flash-lite': return 'Gemini 2.5 Flash Lite';
-      case 'gemini-2.0-flash': return 'Gemini 2.0 Flash';
-      case 'gemini-1.5-flash': return 'Gemini 1.5 Flash';
-      case 'gemini-1.5-pro': return 'Gemini 1.5 Pro';
-      default: return modelId;
-    }
+    if (modelId === 'gpt-4o') return 'GPT-4o (OpenAI)';
+    const found = KNOWN_GEMINI_MODELS.find(m => m.id === modelId) || (availableModelsList || []).find(m => m.id === modelId);
+    if (found) return found.name;
+    return modelId;
   };
 
   // Flashcards Section States
@@ -178,10 +182,26 @@ export default function Workspace({
   const [flashcardScore, setFlashcardScore] = useState({ correct: 0, wrong: 0 })
 
   // Gemini AI Settings & BYOK State
-  const [preferredModel, setPreferredModel] = useState('gemini-2.5-flash')
   const [showApiKey, setShowApiKey] = useState(false)
   const [testStatus, setTestStatus] = useState({ type: '', message: '' })
   const [isTestingConnection, setIsTestingConnection] = useState(false)
+
+  // Listen for automatic model fallback events
+  useEffect(() => {
+    const handleModelFallback = (e) => {
+      const { fromModel, toModel, message } = e.detail || {};
+      if (toModel) {
+        setPreferredModel(toModel);
+        setAskPdfModel(prev => (prev === fromModel ? toModel : prev));
+        setTestStatus({
+          type: 'info',
+          message: message || `Switched model to ${toModel}.`
+        });
+      }
+    };
+    window.addEventListener('gemini:model-fallback', handleModelFallback);
+    return () => window.removeEventListener('gemini:model-fallback', handleModelFallback);
+  }, []);
 
   // Fetch session & cloud settings on initial load
   useEffect(() => {
@@ -192,7 +212,10 @@ export default function Workspace({
         setUserUsage(res.usage);
         if (res.settings) {
           setAiProvider(res.settings.aiProvider || 'platform');
-          setPreferredModel(res.settings.preferredModel || 'gemini-2.5-flash');
+          const serverModel = res.settings.preferredModel;
+          const resolved = resolvePreferredModel(serverModel, getAvailableModels());
+          setPreferredModel(resolved);
+          savePreferredModelStorage(resolved);
           setHasByokKey(res.settings.hasByokKey);
         }
 
@@ -227,11 +250,16 @@ export default function Workspace({
     }
   }, []);
 
-  const handleKeySaved = () => {
+  const handleKeySaved = (savedKey, models) => {
     const key = getStoredApiKey();
     setMaskedKey(getMaskedApiKey());
     setKeyRemembered(isRemembered());
     setHasByokKey(Boolean(key));
+    if (models && models.length > 0) {
+      setAvailableModelsList(models);
+    } else {
+      setAvailableModelsList(getAvailableModels());
+    }
     setSaveStatus('API Key Saved ✓');
     setTimeout(() => setSaveStatus('Saved'), 3000);
   };
@@ -242,6 +270,7 @@ export default function Workspace({
       setMaskedKey('');
       setKeyRemembered(false);
       setHasByokKey(false);
+      setAvailableModelsList(getAvailableModels());
       setSaveStatus('API Key Deleted ✓');
       setTimeout(() => setSaveStatus('Saved'), 3000);
     }
@@ -258,7 +287,13 @@ export default function Workspace({
     const result = await validateGeminiApiKey(key);
     setIsTestingConnection(false);
     if (result.valid) {
-      setTestStatus({ type: 'success', message: '✓ Successfully connected to Google Gemini API from browser!' });
+      if (result.models && result.models.length > 0) {
+        setAvailableModelsList(result.models);
+      }
+      setTestStatus({
+        type: 'success',
+        message: result.warning ? `✓ ${result.warning}` : '✓ Successfully connected to Google Gemini API from browser!'
+      });
     } else {
       setTestStatus({ type: 'error', message: result.error || 'Failed to connect. Please check your key.' });
     }
@@ -2205,6 +2240,10 @@ export default function Workspace({
             onChange={(e) => {
               const val = e.target.value;
               setPreferredModel(val);
+              savePreferredModelStorage(val);
+              if (currentUser) {
+                api.saveByokSettings(undefined, val, aiProvider).catch(() => {});
+              }
               setSaveStatus('Model preference updated ✓');
               setTimeout(() => setSaveStatus('Saved'), 3000);
             }}
@@ -2220,9 +2259,16 @@ export default function Workspace({
               cursor: 'pointer'
             }}
           >
-            <option value="gemini-2.5-flash">Gemini 2.5 Flash (Ultra-fast, high capability - Recommended)</option>
-            <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash Lite (Next-gen light model, instant response)</option>
-            <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite (High availability default)</option>
+            {availableModelsList.map(m => (
+              <option key={m.id} value={m.id}>
+                {m.name} {m.description ? `— ${m.description}` : ''}
+              </option>
+            ))}
+            {!availableModelsList.some(m => m.id === preferredModel) && (
+              <option key={preferredModel} value={preferredModel}>
+                {preferredModel} (Custom / Saved)
+              </option>
+            )}
           </select>
         </div>
 
@@ -3015,12 +3061,12 @@ export default function Workspace({
                   cursor: 'pointer'
                 }}
               >
-                <option value="gemini-3.5-flash">Gemini 3.5 Flash</option>
-                <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
-                <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash Lite</option>
-                <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
-                <option value="gemini-1.5-flash">Gemini 1.5 Flash</option>
-                <option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
+                {availableModelsList.map(m => (
+                  <option key={m.id} value={m.id}>{m.name}</option>
+                ))}
+                {!availableModelsList.some(m => m.id === askPdfModel) && askPdfModel !== 'gpt-4o' && (
+                  <option key={askPdfModel} value={askPdfModel}>{askPdfModel}</option>
+                )}
                 <option value="gpt-4o">GPT-4o (OpenAI)</option>
               </select>
             </div>

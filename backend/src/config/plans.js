@@ -1,6 +1,8 @@
 /**
  * SaaS Subscription Plans & Quota Configuration
  */
+const { GEMINI_FALLBACK_MODELS } = require('./aiConfig');
+
 const PLANS = {
   FREE: {
     id: 'free',
@@ -17,7 +19,7 @@ const PLANS = {
       byokSupported: true,
       exportThemes: ['default', 'academic'],
       watermarkRemovable: false,
-      models: ['gemini-2.5-flash-lite', 'gemini-2.5-flash'],
+      models: [...GEMINI_FALLBACK_MODELS],
       exportFormats: ['pdf', 'md', 'txt']
     }
   },
@@ -36,7 +38,7 @@ const PLANS = {
       byokSupported: true,
       exportThemes: ['default', 'academic', 'minimal', 'modern', 'dark'],
       watermarkRemovable: true,
-      models: ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-3.1-flash-lite'],
+      models: [...GEMINI_FALLBACK_MODELS],
       exportFormats: ['pdf', 'md', 'html', 'txt']
     }
   },
@@ -56,7 +58,7 @@ const PLANS = {
       exportThemes: ['default', 'academic', 'minimal', 'modern', 'dark'],
       watermarkRemovable: true,
       customBranding: true,
-      models: ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-3.1-flash-lite', 'gpt-4o'],
+      models: [...GEMINI_FALLBACK_MODELS, 'gpt-4o'],
       exportFormats: ['pdf', 'md', 'html', 'txt']
     }
   }

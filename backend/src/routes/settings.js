@@ -3,6 +3,7 @@ const { query } = require('../config/db');
 const { requireAuth } = require('../middleware/auth');
 const { encrypt, decrypt, maskApiKey } = require('../services/encryptionService');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { DEFAULT_GEMINI_MODEL } = require('../config/aiConfig');
 
 const router = express.Router();
 
@@ -27,7 +28,7 @@ router.get('/', requireAuth, async (req, res) => {
       success: true,
       settings: {
         aiProvider: settings.ai_provider || 'platform',
-        preferredModel: settings.preferred_model || 'gemini-2.5-flash',
+        preferredModel: settings.preferred_model || DEFAULT_GEMINI_MODEL,
         defaultTheme: settings.default_theme || 'default',
         hasByokKey: !!settings.encrypted_byok_key,
         maskedKey
@@ -61,7 +62,7 @@ router.post('/byok', requireAuth, async (req, res) => {
     const check = await query('SELECT id, encrypted_byok_key FROM user_settings WHERE user_id = $1', [req.user.id]);
 
     const targetProvider = aiProvider || (encryptedKey ? 'byok' : 'platform');
-    const targetModel = preferredModel || 'gemini-2.5-flash';
+    const targetModel = preferredModel || DEFAULT_GEMINI_MODEL;
 
     if (check.rows.length === 0) {
       const id = `set_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -101,7 +102,7 @@ router.post('/byok', requireAuth, async (req, res) => {
 router.post('/test-key', async (req, res) => {
   try {
     let keyToTest = req.body.apiKey;
-    const modelName = req.body.model || req.headers['x-gemini-model'] || 'gemini-2.5-flash';
+    const modelName = req.body.model || req.headers['x-gemini-model'] || DEFAULT_GEMINI_MODEL;
 
     // If no key provided in body, but user is authenticated, check their stored key
     if (!keyToTest && req.user && req.user.id) {

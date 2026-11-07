@@ -161,7 +161,7 @@ async function initDatabase() {
       user_id VARCHAR(64) UNIQUE REFERENCES users(id) ON DELETE CASCADE,
       ai_provider VARCHAR(32) DEFAULT 'platform',
       encrypted_byok_key TEXT,
-      preferred_model VARCHAR(64) DEFAULT 'gemini-2.5-flash',
+      preferred_model VARCHAR(64) DEFAULT 'gemini-3.8-flash',
       default_theme VARCHAR(32) DEFAULT 'default',
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -257,7 +257,7 @@ async function initDatabase() {
       user_id TEXT UNIQUE,
       ai_provider TEXT DEFAULT 'platform',
       encrypted_byok_key TEXT,
-      preferred_model TEXT DEFAULT 'gemini-2.5-flash',
+      preferred_model TEXT DEFAULT 'gemini-3.8-flash',
       default_theme TEXT DEFAULT 'default',
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE

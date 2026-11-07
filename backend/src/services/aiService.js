@@ -8,6 +8,8 @@ const path = require('path');
 const { query } = require('../config/db');
 const { decrypt } = require('./encryptionService');
 
+const { DEFAULT_GEMINI_MODEL, getModelsToTry } = require('../config/aiConfig');
+
 function cleanAndParseJson(rawText) {
   if (!rawText || !rawText.trim()) throw new Error("Empty response from AI model");
   let text = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
@@ -139,26 +141,8 @@ async function resolveAIClient(req) {
     genAI: new GoogleGenerativeAI(resolvedKey),
     fileManager: new GoogleAIFileManager(resolvedKey),
     isByok,
-    preferredModel: preferredModel || 'gemini-2.5-flash'
+    preferredModel: preferredModel || DEFAULT_GEMINI_MODEL
   };
-}
-
-function getModelsToTry(preferredModel) {
-  const models = [];
-  if (preferredModel && preferredModel.trim()) {
-    models.push(preferredModel.trim());
-  }
-  const defaultModels = [
-    'gemini-2.5-flash',
-    'gemini-2.5-flash-lite',
-    'gemini-3.1-flash-lite'
-  ];
-  for (const m of defaultModels) {
-    if (!models.includes(m)) {
-      models.push(m);
-    }
-  }
-  return models;
 }
 
 module.exports = {

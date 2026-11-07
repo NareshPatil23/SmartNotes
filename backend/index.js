@@ -31,6 +31,7 @@ const { initDatabase, query } = require('./src/config/db');
 const { optionalAuth, requireAuth } = require('./src/middleware/auth');
 const { apiLimiter, authLimiter, aiLimiter, heavyLimiter, validateSsrfUrl } = require('./src/middleware/security');
 const { resolveAIClient } = require('./src/services/aiService');
+const { DEFAULT_GEMINI_MODEL, getModelsToTry } = require('./src/config/aiConfig');
 const { checkCanGenerate, recordGeneration } = require('./src/services/usageService');
 const { extractLinkContent } = require('./src/services/linkExtractorService');
 const {
@@ -357,21 +358,7 @@ app.post('/api/extract', aiLimiter, upload.single('document'), async (req, res) 
       return res.status(400).json({ error: `Unsupported file type: ${req.file.mimetype}` });
     }
 
-    const preferredModel = req.headers['x-gemini-model'];
-    const modelsToTry = [];
-    if (preferredModel && preferredModel.trim()) {
-      modelsToTry.push(preferredModel.trim());
-    }
-    const defaultModels = [
-      "gemini-2.5-flash",
-      "gemini-2.5-flash-lite",
-      "gemini-3.1-flash-lite"
-    ];
-    for (const model of defaultModels) {
-      if (!modelsToTry.includes(model)) {
-        modelsToTry.push(model);
-      }
-    }
+    const modelsToTry = getModelsToTry(req.headers['x-gemini-model']);
 
     let lastError = null;
     for (const modelName of modelsToTry) {
@@ -521,21 +508,7 @@ app.post('/api/extract-text', aiLimiter, upload.single('document'), async (req, 
       return res.status(400).json({ error: `Unsupported file type: ${req.file.mimetype}` });
     }
 
-    const preferredModel = req.headers['x-gemini-model'];
-    const modelsToTry = [];
-    if (preferredModel && preferredModel.trim()) {
-      modelsToTry.push(preferredModel.trim());
-    }
-    const defaultModels = [
-      "gemini-2.5-flash",
-      "gemini-2.5-flash-lite",
-      "gemini-3.1-flash-lite"
-    ];
-    for (const model of defaultModels) {
-      if (!modelsToTry.includes(model)) {
-        modelsToTry.push(model);
-      }
-    }
+    const modelsToTry = getModelsToTry(req.headers['x-gemini-model']);
 
     let lastError = null;
     for (const modelName of modelsToTry) {
@@ -572,21 +545,7 @@ app.post('/api/format-ai', aiLimiter, async (req, res) => {
   const { genAI: reqGenAI } = await getAIClient(req);
   if (!reqGenAI) return res.json({ html: `<p>${text}</p>` });
 
-  const preferredModel = req.headers['x-gemini-model'];
-  const modelsToTry = [];
-  if (preferredModel && preferredModel.trim()) {
-    modelsToTry.push(preferredModel.trim());
-  }
-  const defaultModels = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3.1-flash-lite"
-  ];
-  for (const model of defaultModels) {
-    if (!modelsToTry.includes(model)) {
-      modelsToTry.push(model);
-    }
-  }
+  const modelsToTry = getModelsToTry(req.headers['x-gemini-model']);
 
   try {
     for (const modelName of modelsToTry) {
@@ -707,21 +666,7 @@ app.post('/api/import-link', requireAuth, aiLimiter, heavyLimiter, async (req, r
 
   console.log(`[Backend] Extracted ${contentText.length} chars. Passing to Gemini AI...`);
 
-  const preferredModel = req.headers['x-gemini-model'];
-  const modelsToTry = [];
-  if (preferredModel && preferredModel.trim()) {
-    modelsToTry.push(preferredModel.trim());
-  }
-  const defaultModels = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3.1-flash-lite"
-  ];
-  for (const model of defaultModels) {
-    if (!modelsToTry.includes(model)) {
-      modelsToTry.push(model);
-    }
-  }
+  const modelsToTry = getModelsToTry(req.headers['x-gemini-model']);
 
   const systemPrompt = `
     You are an expert academic text-to-HTML formatting tool. Your task is to extract content from the provided source page and convert it into a beautifully structured, premium educational Q&A notes format.
@@ -836,7 +781,7 @@ app.post('/api/test-connection', async (req, res) => {
       return res.status(400).json({ success: false, error: 'No API key provided.' });
     }
 
-    const preferredModel = req.headers['x-gemini-model'] || 'gemini-3.1-flash-lite';
+    const preferredModel = req.headers['x-gemini-model'] || DEFAULT_GEMINI_MODEL;
     const model = reqGenAI.getGenerativeModel({ model: preferredModel });
     
     // Quick, low-latency test generation
@@ -927,21 +872,7 @@ INSTRUCTIONS:
       }
 
       // Priority list of models to try
-      const preferredModel = modelName;
-      const modelsToTry = [];
-      if (preferredModel && preferredModel.trim()) {
-        modelsToTry.push(preferredModel.trim());
-      }
-      const defaultModels = [
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-3.1-flash-lite"
-      ];
-      for (const model of defaultModels) {
-        if (!modelsToTry.includes(model)) {
-          modelsToTry.push(model);
-        }
-      }
+      const modelsToTry = getModelsToTry(modelName);
 
       let lastError = null;
       let successfulModel = null;
