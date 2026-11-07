@@ -11,9 +11,12 @@
   },
   "dependencies": {
     "dompurify": "^3.4.1",
+    "highlight.js": "^11.12.0",
     "jspdf": "^4.2.1",
     "jspdf-autotable": "^5.0.9",
+    "katex": "^0.19.1",
     "marked": "^18.0.3",
+    "mermaid": "12.3.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

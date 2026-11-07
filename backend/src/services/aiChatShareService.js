@@ -127,7 +127,12 @@ function pairMessagesIntoTurns(messages) {
       rawText = msg.content.parts
         .map(p => {
           if (typeof p === 'string') return p;
-          if (p && typeof p === 'object' && p.text) return p.text;
+          if (p && typeof p === 'object') {
+            if (p.text) return p.text;
+            if (p.content_type?.includes('image') || p.asset_pointer || p.image_url) {
+              return '[Image: Attached visual (not imported from AI chat)]';
+            }
+          }
           return '';
         })
         .join('\n');

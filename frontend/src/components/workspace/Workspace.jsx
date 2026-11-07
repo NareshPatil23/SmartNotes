@@ -17,6 +17,7 @@ import {
   DEFAULT_MODEL
 } from '../../services/geminiClient'
 import AiChatImportModal from './AiChatImportModal'
+import { formatAnswerWithDiagrams, hydrateMermaidContainers } from '../../utils/mermaidHelper'
 
 const RichEditor = lazy(() => import('../RichEditor'))
 const AuthModal = lazy(() => import('../auth/AuthModal'))
@@ -315,43 +316,21 @@ export default function Workspace({
   );
   const isDuplicate = duplicateIdx !== -1;
 
-  const loadExternalStylesheet = (href) => {
-    if (document.querySelector(`link[href="${href}"]`)) return;
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href = href;
-    document.head.appendChild(link);
-  };
-
-  const loadExternalScript = (src) => {
-    return new Promise((resolve) => {
-      if (document.querySelector(`script[src="${src}"]`)) return resolve();
-      const script = document.createElement('script');
-      script.src = src;
-      script.async = true;
-      script.onload = () => resolve();
-      script.onerror = () => resolve();
-      document.body.appendChild(script);
-    });
-  };
-
   const ensurePreviewLibraries = useCallback(async () => {
-    loadExternalStylesheet('https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css');
-    loadExternalStylesheet('https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css');
-
     const promises = [];
     if (!window.hljs) {
-      promises.push(loadExternalScript('https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js'));
+      promises.push(
+        import('highlight.js').then((m) => {
+          window.hljs = m.default || m;
+        })
+      );
     }
     if (!window.renderMathInElement) {
       promises.push(
-        loadExternalScript('https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js').then(() =>
-          loadExternalScript('https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js')
-        )
+        import('katex/dist/contrib/auto-render.mjs').then((m) => {
+          window.renderMathInElement = m.default || m;
+        })
       );
-    }
-    if (!window.mermaid) {
-      promises.push(loadExternalScript('https://cdn.jsdelivr.net/npm/mermaid@10.8.0/dist/mermaid.min.js'));
     }
     if (promises.length > 0) {
       await Promise.all(promises);
@@ -390,24 +369,10 @@ export default function Workspace({
       });
     }
     
-    if (previewRef.current && window.mermaid) {
-      try {
-        window.mermaid.initialize({
-          startOnLoad: false,
-          theme: 'default',
-          securityLevel: 'loose',
-          fontFamily: "'Inter', sans-serif",
-          look: isHandwrittenMode ? 'handDrawn' : 'classic'
-        });
-        await window.mermaid.run({
-          querySelector: '.mermaid',
-          suppressErrors: true
-        });
-      } catch (err) {
-        console.warn('Mermaid rendering skipped or failed:', err);
-      }
+    if (previewRef.current) {
+      await hydrateMermaidContainers(previewRef.current, isDarkMode);
     }
-  }, [isHandwrittenMode, ensurePreviewLibraries]);
+  }, [isHandwrittenMode, ensurePreviewLibraries, isDarkMode]);
 
   useEffect(() => {
     if (showPreview) {
@@ -1335,17 +1300,7 @@ export default function Workspace({
 
     const importedQuestions = turns.map((turn, index) => {
       const cleanQuestion = DOMPurify.sanitize(turn.question || '', { ALLOWED_TAGS: [] });
-      let formattedAnswer = DOMPurify.sanitize(turn.answer || '', {
-        ALLOWED_TAGS: [
-          'p', 'br', 'strong', 'em', 'u', 's', 'code', 'pre', 'blockquote',
-          'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'table', 'thead', 'tbody',
-          'tr', 'th', 'td', 'mark', 'hr'
-        ],
-        ALLOWED_ATTR: ['class', 'style', 'align']
-      });
-      if (!formattedAnswer.startsWith('<')) {
-        formattedAnswer = '<p>' + formattedAnswer.replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br/>') + '</p>';
-      }
+      const formattedAnswer = formatAnswerWithDiagrams(turn.answer || '');
       return {
         number: questions.length + index + 1,
         question: cleanQuestion,
@@ -4607,6 +4562,7 @@ export default function Workspace({
         setSaveStatus={setSaveStatus}
         getStoredApiKey={getStoredApiKey}
         setShowKeyModal={setShowKeyModal}
+        isDarkMode={isDarkMode}
       />
 
       {showExportModal && (

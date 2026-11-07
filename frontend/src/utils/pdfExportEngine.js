@@ -1,5 +1,6 @@
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import { hydrateMermaidContainers } from './mermaidHelper';
 
 // In-memory cache for downloaded TTF font binary base64 strings
 const fontCache = new Map();
@@ -50,13 +51,24 @@ function arrayBufferToBase64(buffer) {
 /**
  * Helper to convert an SVG element to high-res PNG Data URL
  */
-async function svgToPngDataUrl(svgElement, scale = 2) {
+async function svgToPngDataUrl(svgElement, scale = 3) {
   return new Promise((resolve) => {
     try {
       const svgClone = svgElement.cloneNode(true);
       const bbox = svgElement.getBoundingClientRect();
-      const width = bbox.width > 0 ? bbox.width : (parseFloat(svgElement.getAttribute('width')) || 400);
-      const height = bbox.height > 0 ? bbox.height : (parseFloat(svgElement.getAttribute('height')) || 250);
+      let width = bbox.width > 0 ? bbox.width : 0;
+      let height = bbox.height > 0 ? bbox.height : 0;
+      if (!width || !height) {
+        if (svgElement.viewBox && svgElement.viewBox.baseVal && svgElement.viewBox.baseVal.width > 0) {
+          width = svgElement.viewBox.baseVal.width;
+          height = svgElement.viewBox.baseVal.height;
+        } else {
+          width = parseFloat(svgElement.getAttribute('width')) || 600;
+          height = parseFloat(svgElement.getAttribute('height')) || 400;
+        }
+      }
+      svgClone.setAttribute('width', width);
+      svgClone.setAttribute('height', height);
 
       const xml = new XMLSerializer().serializeToString(svgClone);
       const svgBlob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' });
@@ -369,7 +381,18 @@ export async function generateClientPDF(options = {}) {
 
       // Parse HTML structure
       const tempDiv = document.createElement('div');
+      tempDiv.style.position = 'fixed';
+      tempDiv.style.left = '-9999px';
+      tempDiv.style.top = '0';
+      tempDiv.style.width = '800px';
       tempDiv.innerHTML = q.answer;
+      document.body.appendChild(tempDiv);
+
+      try {
+        await hydrateMermaidContainers(tempDiv, false);
+      } catch (err) {
+        console.warn('Hydrating mermaid diagrams in PDF export warning:', err);
+      }
 
       // Render each child block sequentially
       const nodes = Array.from(tempDiv.children);
@@ -391,7 +414,10 @@ export async function generateClientPDF(options = {}) {
         });
       } else {
         for (const node of nodes) {
-          if (signal?.aborted) throw new Error('AbortError');
+          if (signal?.aborted) {
+            tempDiv.remove();
+            throw new Error('AbortError');
+          }
           await renderNodeBlock(doc, node, {
             chosenFontKey,
             baseFontSize,
@@ -410,6 +436,7 @@ export async function generateClientPDF(options = {}) {
           });
         }
       }
+      tempDiv.remove();
 
       currentY += isCursiveMode ? 9 : 8;
     }
@@ -560,14 +587,29 @@ async function renderNodeBlock(doc, node, ctx) {
     return;
   }
 
-  // 2. Diagrams (Mermaid SVG)
-  if (className.includes('mermaid') || tagName === 'SVG') {
-    const rendered = await domElementToPngDataUrl(node, 2.5);
+  // 2. Diagrams (Mermaid SVG & containers)
+  if (
+    (className.includes('mermaid') || tagName === 'SVG' || className.includes('mermaid-diagram-container') || node.querySelector('.mermaid, svg, .mermaid-diagram-container')) &&
+    !className.includes('mermaid-error-banner') &&
+    !node.querySelector('.mermaid-error-banner')
+  ) {
+    const targetElement = tagName === 'SVG' ? node : (node.querySelector('svg') || node);
+    const rendered = await domElementToPngDataUrl(targetElement, 3.0);
     if (rendered && rendered.dataUrl) {
-      const imgWidth = Math.min(contentWidth, 140);
-      const imgHeight = (rendered.height / rendered.width) * imgWidth;
+      const maxPdfHeight = pageHeight - marginConfig.top - marginConfig.bottom - 15;
+      let imgWidth = Math.min(contentWidth, 160);
+      let imgHeight = (rendered.height / rendered.width) * imgWidth;
 
-      if (getY() + imgHeight > pageHeight - marginConfig.bottom) addNewPage();
+      // Prevent cut-off: if diagram height exceeds full page printable area, scale proportionally
+      if (imgHeight > maxPdfHeight) {
+        imgHeight = maxPdfHeight;
+        imgWidth = (rendered.width / rendered.height) * imgHeight;
+      }
+
+      // Check if page break needed
+      if (getY() + imgHeight > pageHeight - marginConfig.bottom) {
+        addNewPage();
+      }
 
       const posX = (pageWidth - imgWidth) / 2;
       doc.addImage(rendered.dataUrl, 'PNG', posX, getY(), imgWidth, imgHeight);
@@ -647,14 +689,24 @@ async function renderNodeBlock(doc, node, ctx) {
     }
   }
 
-  // 5. Code Blocks (PRE, CODE)
-  if (tagName === 'PRE' || tagName === 'CODE' || node.querySelector('code')) {
+  // 5. Code Blocks & ASCII Diagrams (PRE, CODE, .ascii-block)
+  if (tagName === 'PRE' || tagName === 'CODE' || className.includes('ascii-block') || node.querySelector('code')) {
     const codeText = node.innerText || node.textContent || '';
-    doc.setFont('FiraCode', 'normal');
-    doc.setFontSize(baseFontSize - 1.5);
+    const rawLines = codeText.trimEnd().split('\n');
+    const maxLineLen = Math.max(...rawLines.map(l => l.length), 1);
 
-    const codeLines = doc.splitTextToSize(codeText.trim(), contentWidth - 8);
-    const blockHeight = codeLines.length * 4.5 + 6;
+    // Keep ASCII diagrams and code blocks unwrapped to preserve exact geometry
+    const maxAllowedWidth = contentWidth - 8;
+    const charWidthPt = (baseFontSize - 1.5) * 0.22;
+    let codeFontSize = baseFontSize - 1.5;
+    if (maxLineLen * charWidthPt > maxAllowedWidth) {
+      codeFontSize = Math.max(5.5, maxAllowedWidth / (maxLineLen * 0.22));
+    }
+
+    doc.setFont('FiraCode', 'normal');
+    doc.setFontSize(codeFontSize);
+    const lineHeight = codeFontSize * 0.44;
+    const blockHeight = rawLines.length * lineHeight + 6;
 
     if (getY() + blockHeight > pageHeight - marginConfig.bottom) addNewPage();
 
@@ -664,10 +716,10 @@ async function renderNodeBlock(doc, node, ctx) {
     doc.roundedRect(marginConfig.left, getY(), contentWidth, blockHeight, 2, 2, 'FD');
 
     doc.setTextColor(30, 41, 59);
-    let lineY = getY() + 5;
-    for (const line of codeLines) {
+    let lineY = getY() + (lineHeight * 0.9) + 2;
+    for (const line of rawLines) {
       doc.text(line, marginConfig.left + 4, lineY);
-      lineY += 4.5;
+      lineY += lineHeight;
     }
 
     setY(getY() + blockHeight + 5);
@@ -701,6 +753,32 @@ async function renderNodeBlock(doc, node, ctx) {
     });
 
     setY(getY() + boxHeight + 4);
+    return;
+  }
+
+  // 6b. Neutral Chat Image Placeholder (Option A)
+  if (className.includes('chat-image-placeholder')) {
+    const text = node.innerText.trim();
+    doc.setFont(chosenFontKey, 'normal');
+    doc.setFontSize(baseFontSize - 1.5);
+    const lines = doc.splitTextToSize(text, contentWidth - 14);
+    const boxHeight = lines.length * 4.5 + 6;
+
+    if (getY() + boxHeight > pageHeight - marginConfig.bottom) addNewPage();
+
+    doc.setFillColor(241, 245, 249);
+    doc.setDrawColor(203, 213, 225);
+    doc.roundedRect(marginConfig.left, getY(), contentWidth, boxHeight, 1.5, 1.5, 'FD');
+
+    doc.setTextColor(71, 85, 105);
+    let lineY = getY() + 4.5;
+    for (const line of lines) {
+      doc.text(line, marginConfig.left + 5, lineY);
+      lineY += 4.5;
+    }
+
+    setY(getY() + boxHeight + 4);
+    doc.setFont(chosenFontKey, 'normal');
     return;
   }
 

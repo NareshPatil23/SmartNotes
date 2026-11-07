@@ -1,5 +1,40 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import DOMPurify from 'dompurify';
+import { formatAnswerWithDiagrams, hydrateMermaidContainers } from '../../utils/mermaidHelper';
+
+function TurnAnswerPreview({ answer, isDarkMode = false }) {
+  const containerRef = useRef(null);
+
+  const formattedHtml = useMemo(() => {
+    return formatAnswerWithDiagrams(answer);
+  }, [answer]);
+
+  useEffect(() => {
+    if (containerRef.current) {
+      hydrateMermaidContainers(containerRef.current, isDarkMode);
+    }
+  }, [formattedHtml, isDarkMode]);
+
+  return (
+    <div
+      ref={containerRef}
+      className="turn-answer-preview"
+      style={{
+        marginTop: '0.5rem',
+        padding: '0.75rem',
+        background: isDarkMode ? '#1e293b' : '#f8fafc',
+        border: `1px solid ${isDarkMode ? '#334155' : '#e2e8f0'}`,
+        borderRadius: '6px',
+        fontSize: '0.85rem',
+        color: isDarkMode ? '#f1f5f9' : '#334155',
+        maxHeight: '350px',
+        overflowY: 'auto',
+        lineHeight: '1.5'
+      }}
+      dangerouslySetInnerHTML={{ __html: formattedHtml }}
+    />
+  );
+}
 
 export default function AiChatImportModal({
   isOpen,
@@ -8,7 +43,8 @@ export default function AiChatImportModal({
   safeApiFetch,
   setSaveStatus,
   getStoredApiKey,
-  setShowKeyModal
+  setShowKeyModal,
+  isDarkMode = false
 }) {
   const [activeTab, setActiveTab] = useState('link'); // 'link' | 'paste' | 'upload'
   const [shareUrl, setShareUrl] = useState('');
@@ -268,7 +304,14 @@ export default function AiChatImportModal({
       let text = '';
       if (typeof msg.content === 'string') text = msg.content;
       else if (Array.isArray(msg.content?.parts)) {
-        text = msg.content.parts.map(p => (typeof p === 'string' ? p : p?.text || '')).join('\n');
+        text = msg.content.parts.map(p => {
+          if (typeof p === 'string') return p;
+          if (p?.text) return p.text;
+          if (p?.content_type?.includes('image') || p?.asset_pointer || p?.image_url) {
+            return '[Image: Attached visual (not imported from AI chat)]';
+          }
+          return '';
+        }).join('\n');
       }
 
       text = (text || '').trim();
@@ -797,32 +840,7 @@ export default function AiChatImportModal({
 
                           {/* Expanded Answer Content */}
                           {isExpanded && (
-                            <div
-                              style={{
-                                marginTop: '0.5rem',
-                                padding: '0.5rem 0.75rem',
-                                background: '#f8fafc',
-                                border: '1px solid #e2e8f0',
-                                borderRadius: '4px',
-                                fontSize: '0.8rem',
-                                color: '#334155',
-                                maxHeight: '200px',
-                                overflowY: 'auto',
-                                whiteSpace: 'pre-wrap',
-                                wordBreak: 'break-word',
-                                lineHeight: '1.4'
-                              }}
-                              dangerouslySetInnerHTML={{
-                                __html: DOMPurify.sanitize(turn.answer, {
-                                  ALLOWED_TAGS: [
-                                    'p', 'br', 'strong', 'em', 'u', 's', 'code', 'pre', 'blockquote',
-                                    'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'table', 'thead', 'tbody',
-                                    'tr', 'th', 'td', 'mark', 'hr'
-                                  ],
-                                  ALLOWED_ATTR: ['class', 'style', 'align']
-                                })
-                              }}
-                            />
+                            <TurnAnswerPreview answer={turn.answer} isDarkMode={isDarkMode} />
                           )}
                         </div>
                       </div>
