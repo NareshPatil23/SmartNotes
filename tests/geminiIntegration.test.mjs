@@ -547,30 +547,93 @@ describe('Diagram Recognition & Hydration for GPT Paste', () => {
 });
 
 describe('Format All: Block Detection, Concurrency, and 429 Exponential Backoff', () => {
-  test('isAlreadyFormatted correctly identifies unformatted vs already-formatted content', () => {
-    // Empty cases
+  test('isAlreadyFormatted relies on explicit formattedByAI flag, not content shape', () => {
+    // Null/undefined/empty
+    assert.equal(isAlreadyFormatted(null), false);
+    assert.equal(isAlreadyFormatted(undefined), false);
     assert.equal(isAlreadyFormatted(''), false);
-    assert.equal(isAlreadyFormatted('   '), false);
-    assert.equal(isAlreadyFormatted('<p></p>'), false);
-    assert.equal(isAlreadyFormatted('<p><br></p>'), false);
 
-    // Unformatted plain content
-    assert.equal(isAlreadyFormatted('<p>Photosynthesis produces glucose from CO2 and water.</p>'), false);
-    assert.equal(isAlreadyFormatted('Just raw notes without structure or headings.'), false);
+    // Block with headings and bullets pasted from GPT or written manually WITHOUT formattedByAI flag
+    const pastedGptBlock = {
+      question: 'What is TCP?',
+      answer: '<h2>Transmission Control Protocol</h2><ul><li>Reliable byte stream</li><li>Three-way handshake</li></ul>'
+    };
+    assert.equal(
+      isAlreadyFormatted(pastedGptBlock),
+      false,
+      'Blocks with headings and bullets but no formattedByAI flag must NOT be considered already formatted'
+    );
 
-    // Formatted content (contains headings and bullet/ordered lists)
-    assert.equal(
-      isAlreadyFormatted('<h2>Key Concepts</h2><ul><li>Point 1</li><li>Point 2</li></ul>'),
-      true
-    );
-    assert.equal(
-      isAlreadyFormatted('<h1>Title</h1><p>Intro</p><ol><li>Step A</li></ol>'),
-      true
-    );
-    assert.equal(
-      isAlreadyFormatted('## Overview\n- Three-way handshake\n- Flow control'),
-      true
-    );
+    // Block formatted by Gemini with explicit formattedByAI: true flag
+    const aiFormattedBlock = {
+      question: 'What is TCP?',
+      answer: '<h2>Transmission Control Protocol</h2><ul><li>Reliable byte stream</li><li>Three-way handshake</li></ul>',
+      formattedByAI: true,
+      formattedModel: 'gemini-3.6-flash',
+      formattedAt: Date.now()
+    };
+    assert.equal(isAlreadyFormatted(aiFormattedBlock), true);
+  });
+
+  test('A block with headings and bullets but no formattedByAI flag must be sent to Gemini', async () => {
+    saveApiKey('AIzaSyValidKey', true);
+    let capturedPrompt = '';
+
+    global.fetch = async (url, options) => {
+      const body = JSON.parse(options.body);
+      capturedPrompt = body.contents[0].parts[0].text;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [{ text: '<h2>Formatted by Gemini</h2><ul><li>Enhanced point</li></ul>' }]
+              }
+            }
+          ]
+        })
+      };
+    };
+
+    // A block with headings and bullets, e.g. pasted from ChatGPT or external source
+    const rawPastedBlock = {
+      question: 'Distributed Consensus',
+      answer: '<h2>Raft Protocol</h2><ul><li>Leader election</li><li>Log replication</li></ul>'
+      // Notice: NO formattedByAI flag!
+    };
+
+    // Should NOT be skipped
+    assert.equal(isAlreadyFormatted(rawPastedBlock), false);
+
+    // Filter logic as used in Workspace
+    const shouldFormat = !isAlreadyFormatted(rawPastedBlock) && Boolean(rawPastedBlock.answer.trim());
+    assert.equal(shouldFormat, true, 'Block must be selected for formatting');
+
+    // Simulate formatting
+    const formattedHtml = await formatBlockWithRetry({
+      text: rawPastedBlock.answer,
+      model: 'gemini-3.6-flash'
+    });
+
+    const now = Date.now();
+    const updatedBlock = {
+      ...rawPastedBlock,
+      answer: formattedHtml,
+      formattedByAI: true,
+      formattedModel: 'gemini-3.6-flash',
+      formattedAt: now
+    };
+
+    assert.ok(capturedPrompt.includes('Raft Protocol'), 'Raw text must have been sent to Gemini');
+    assert.match(updatedBlock.answer, /<h2>Formatted by Gemini<\/h2>/);
+    assert.equal(updatedBlock.formattedByAI, true);
+    assert.equal(updatedBlock.formattedModel, 'gemini-3.6-flash');
+    assert.equal(typeof updatedBlock.formattedAt, 'number');
+
+    // Second check without force reformat: now it IS recognized as already formatted
+    assert.equal(isAlreadyFormatted(updatedBlock), true, 'Now that formattedByAI is true, it is recognized as already formatted');
   });
 
   test('runWithConcurrency runs at most 3 tasks at a time', async () => {
@@ -641,20 +704,32 @@ describe('Format All: Block Detection, Concurrency, and 429 Exponential Backoff'
     assert.equal(attempts, 3, 'Should have retried twice and succeeded on 3rd attempt');
   });
 
-  test('Format All simulation: 10+ questions, 1 already formatted, 1 empty, and 1 persistent 429 error', async () => {
+  test('Format All simulation: real counts with skipped (already formatted), skipped (empty), and failed', async () => {
     saveApiKey('AIzaSyValidKey', true);
 
     // Setup 11 questions
     // Q0: Empty
-    // Q1: Already formatted
-    // Q2..Q9: Unformatted normal
+    // Q1: Already formatted (has formattedByAI: true)
+    // Q2: Pasted from GPT with headings & bullets (NO flag -> MUST be formatted!)
+    // Q3..Q9: Unformatted raw draft answers
     // Q10: Simulated persistent 429 failure
     const rawQuestions = [
       { question: 'Q0', answer: '<p><br></p>' },
-      { question: 'Q1', answer: '<h2>Existing</h2><ul><li>Already formatted</li></ul>' },
-      ...Array.from({ length: 8 }, (_, i) => ({
-        question: `Question ${i + 2}`,
-        answer: `<p>Unformatted raw draft answer ${i + 2}</p>`
+      {
+        question: 'Q1',
+        answer: '<h2>Existing</h2><ul><li>Already formatted</li></ul>',
+        formattedByAI: true,
+        formattedModel: 'gemini-3.6-flash',
+        formattedAt: Date.now() - 60000
+      },
+      {
+        question: 'Q2',
+        answer: '<h2>Pasted from ChatGPT</h2><ul><li>Key bullet point</li></ul>'
+        // No formattedByAI flag -> should be formatted!
+      },
+      ...Array.from({ length: 7 }, (_, i) => ({
+        question: `Question ${i + 3}`,
+        answer: `<p>Unformatted raw draft answer ${i + 3}</p>`
       })),
       { question: 'Q10', answer: '<p>Unformatted text that hits persistent 429</p>' }
     ];
@@ -663,18 +738,29 @@ describe('Format All: Block Detection, Concurrency, and 429 Exponential Backoff'
 
     // Filter targets exactly as Workspace handleFormatAll does
     const targets = [];
+    let skippedEmptyCount = 0;
+    let skippedAlreadyCount = 0;
+
     rawQuestions.forEach((block, idx) => {
       const ans = block.answer || '';
       const textOnly = ans.replace(/<[^>]*>/g, '').trim();
-      if (!textOnly) return; // skip empty
-      if (isAlreadyFormatted(ans)) return; // skip already formatted
+      if (!textOnly) {
+        skippedEmptyCount++;
+        return;
+      }
+      if (isAlreadyFormatted(block)) {
+        skippedAlreadyCount++;
+        return;
+      }
       targets.push({ index: idx, text: ans });
     });
 
-    // Should skip Q0 (empty) and Q1 (already formatted), leaving 9 targets
+    // Should skip Q0 (empty = 1) and Q1 (already formatted = 1)
+    // Q2 MUST be included because it has no formattedByAI flag!
+    assert.equal(skippedEmptyCount, 1, 'Q0 should be counted as skipped empty');
+    assert.equal(skippedAlreadyCount, 1, 'Q1 should be counted as skipped already formatted');
     assert.equal(targets.length, 9);
-    assert.equal(targets.some(t => t.index === 0), false, 'Q0 should be skipped');
-    assert.equal(targets.some(t => t.index === 1), false, 'Q1 should be skipped');
+    assert.equal(targets.some(t => t.index === 2), true, 'Q2 (pasted with headings/bullets) MUST be queued for Gemini');
 
     // Mock fetch for targets
     global.fetch = async (url, options) => {
@@ -733,7 +819,10 @@ describe('Format All: Block Detection, Concurrency, and 429 Exponential Backoff'
         const { target, clean } = taskResult.value;
         workingQuestions[target.index] = {
           ...workingQuestions[target.index],
-          answer: clean
+          answer: clean,
+          formattedByAI: true,
+          formattedModel: 'gemini-3.6-flash',
+          formattedAt: Date.now()
         };
       } else {
         const item = taskResult.status === 'fulfilled' ? taskResult.value.target : null;
@@ -742,24 +831,29 @@ describe('Format All: Block Detection, Concurrency, and 429 Exponential Backoff'
     });
 
     assert.equal(completedCount, 9);
-    // 8 should succeed, 1 should fail (Q10)
     assert.equal(failedTargets.length, 1);
     assert.equal(failedTargets[0].index, 10);
 
-    // Q0 untouched (empty)
+    // Q0 untouched
     assert.equal(workingQuestions[0].answer, '<p><br></p>');
-    // Q1 untouched (already formatted)
+    // Q1 untouched
     assert.equal(workingQuestions[1].answer, '<h2>Existing</h2><ul><li>Already formatted</li></ul>');
-    // Q2..Q9 formatted
-    for (let i = 2; i <= 9; i++) {
-      assert.match(workingQuestions[i].answer, /<h2>Formatted Answer<\/h2>/);
-    }
+    // Q2 formatted and flag added
+    assert.match(workingQuestions[2].answer, /<h2>Formatted Answer<\/h2>/);
+    assert.equal(workingQuestions[2].formattedByAI, true);
     // Q10 original text untouched on failure
     assert.equal(workingQuestions[10].answer, '<p>Unformatted text that hits persistent 429</p>');
 
-    // Summary toast message matches requirement
+    // Real count summary message test:
     const successCount = targets.length - failedTargets.length;
-    const toastMsg = `${successCount} formatted, ${failedTargets.length} failed`;
-    assert.equal(toastMsg, '8 formatted, 1 failed');
+    const failedCount = failedTargets.length;
+    const parts = [];
+    parts.push(`${successCount} formatted`);
+    if (skippedAlreadyCount > 0) parts.push(`${skippedAlreadyCount} skipped (already formatted)`);
+    if (skippedEmptyCount > 0) parts.push(`${skippedEmptyCount} skipped (empty)`);
+    if (failedCount > 0) parts.push(`${failedCount} failed`);
+
+    const toastMsg = parts.join(', ');
+    assert.equal(toastMsg, '8 formatted, 1 skipped (already formatted), 1 skipped (empty), 1 failed');
   });
 });

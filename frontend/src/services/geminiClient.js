@@ -531,23 +531,20 @@ INSTRUCTIONS:
 }
 
 /**
- * Returns true if the HTML string is already "rich" (contains headings and bullet lists),
- * indicating it has already been AI-formatted.
+ * Returns true if a question/answer block has explicitly been formatted by AI.
+ * The content-shape heuristic (headings/bullets) is replaced with the explicit flag
+ * `formattedByAI: true` so manually written or pasted notes (e.g. from ChatGPT)
+ * that happen to contain headings/bullets are never incorrectly skipped.
+ *
+ * @param {object|string} block Question/answer block object or HTML string
+ * @returns {boolean}
  */
-export function isAlreadyFormatted(html) {
-  if (!html || typeof html !== 'string') return false;
-  const stripped = html.replace(/<[^>]*>/g, '').trim();
-  if (!stripped) return false;
-
-  const hasHtmlHeading = /<h[1-6][\s>]/i.test(html);
-  const hasHtmlList = /<(ul|ol)[\s>]/i.test(html);
-  const hasMdHeading = /(^|\n)#{1,6}\s+\S+/m.test(html);
-  const hasMdList = /(^|\n)\s*[-*+]\s+\S+/m.test(html);
-
-  const hasHeading = hasHtmlHeading || hasMdHeading;
-  const hasList = hasHtmlList || hasMdList;
-
-  return hasHeading && hasList;
+export function isAlreadyFormatted(block) {
+  if (!block) return false;
+  if (typeof block === 'object') {
+    return Boolean(block.formattedByAI);
+  }
+  return false;
 }
 
 /**

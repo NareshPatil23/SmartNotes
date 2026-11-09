@@ -144,6 +144,7 @@ export default function Workspace({
   const [formatAllProgress, setFormatAllProgress] = useState({ current: 0, total: 0 })
   const [formatAllSnapshot, setFormatAllSnapshot] = useState(null)
   const [formatAllToast, setFormatAllToast] = useState(null)
+  const [forceReformatAll, setForceReformatAll] = useState(false)
   const formatAllToastTimerRef = useRef(null)
 
   // Summarize Section States
@@ -866,11 +867,27 @@ export default function Workspace({
     try {
       // Shared block formatter
       const cleanHtml = await formatBlock(currentContent, key);
+      const now = Date.now();
       
       setAnswerText(cleanHtml);
       if (richEditorRef.current) {
         richEditorRef.current.setContent(cleanHtml);
       }
+      // Attach explicit AI formatting metadata to current question
+      setQuestions(prev => {
+        const newQ = [...prev];
+        if (activeQuestionIdx < newQ.length) {
+          newQ[activeQuestionIdx] = {
+            ...newQ[activeQuestionIdx],
+            answer: cleanHtml,
+            formattedByAI: true,
+            formattedModel: preferredModel,
+            formattedAt: now
+          };
+        }
+        return newQ;
+      });
+
       if (previewRef.current) {
         await hydrateMermaidContainers(previewRef.current, isDarkMode);
       }
@@ -897,6 +914,14 @@ export default function Workspace({
       return;
     }
 
+    // If user selected Force Reformat All, confirm before proceeding
+    if (forceReformatAll && !retryTargets) {
+      const confirmed = window.confirm(
+        "Force reformat will ignore previous AI formatting flags and send all non-empty questions to Gemini. Proceed?"
+      );
+      if (!confirmed) return;
+    }
+
     // 1. Sync current editor content into questions list
     const currentContent = richEditorRef.current ? richEditorRef.current.getContent() : answerText;
     let allBlocks = [...questions];
@@ -904,7 +929,12 @@ export default function Workspace({
       number: autoNumbering ? activeQuestionIdx + 1 : questionNumber,
       question: questionText,
       answer: currentContent,
-      marks: marksText
+      marks: marksText,
+      ...(allBlocks[activeQuestionIdx] ? {
+        formattedByAI: allBlocks[activeQuestionIdx].formattedByAI,
+        formattedModel: allBlocks[activeQuestionIdx].formattedModel,
+        formattedAt: allBlocks[activeQuestionIdx].formattedAt
+      } : {})
     };
     if (activeQuestionIdx < allBlocks.length) {
       allBlocks[activeQuestionIdx] = currentQ;
@@ -927,23 +957,44 @@ export default function Workspace({
       });
     }
 
-    // 3. Determine targets to format (skip empty or already formatted)
+    // 3. Determine targets to format (skip empty; skip already formatted unless Force is checked)
     let targets = [];
+    let skippedEmptyCount = 0;
+    let skippedAlreadyCount = 0;
+
     if (Array.isArray(retryTargets) && retryTargets.length > 0) {
       targets = retryTargets;
+      console.log(`[Format All] Retrying ${targets.length} previously failed blocks.`);
     } else {
       allBlocks.forEach((block, idx) => {
         const ans = block.answer || '';
         const stripped = ans.replace(/<[^>]*>/g, '').trim();
-        if (!stripped) return; // skip empty
-        if (isAlreadyFormatted(ans)) return; // skip already formatted
+
+        if (!stripped) {
+          skippedEmptyCount++;
+          console.log(`[Format All] Block #${idx + 1} skipped (empty content).`);
+          return;
+        }
+
+        // Check explicit formattedByAI flag (only skip if not forcing reformat)
+        if (!forceReformatAll && isAlreadyFormatted(block)) {
+          skippedAlreadyCount++;
+          console.log(`[Format All] Block #${idx + 1} skipped (already formatted by AI with ${block.formattedModel || 'Gemini'} at ${block.formattedAt ? new Date(block.formattedAt).toLocaleTimeString() : 'earlier'}).`);
+          return;
+        }
+
         targets.push({ index: idx, text: ans });
+        console.log(`[Format All] Block #${idx + 1} queued for Gemini (${preferredModel}). Length: ${ans.length} chars.`);
       });
     }
 
     if (targets.length === 0) {
+      const summaryParts = ['0 formatted'];
+      if (skippedAlreadyCount > 0) summaryParts.push(`${skippedAlreadyCount} skipped (already formatted)`);
+      if (skippedEmptyCount > 0) summaryParts.push(`${skippedEmptyCount} skipped (empty)`);
+
       showFormatAllToast({
-        message: 'All blocks are already formatted or empty.',
+        message: summaryParts.join(', '),
         failedTargets: []
       });
       return;
@@ -959,10 +1010,13 @@ export default function Workspace({
     const failedTargets = [];
 
     const tasks = targets.map((target) => async () => {
+      console.log(`[Format All] Block #${target.index + 1} sent to Gemini (${preferredModel})...`);
       try {
         const cleanHtml = await formatBlock(target.text, key);
+        console.log(`[Format All] Block #${target.index + 1} successfully formatted.`);
         return { success: true, target, cleanHtml };
       } catch (err) {
+        console.warn(`[Format All] Block #${target.index + 1} failed:`, err?.message || err);
         return { success: false, target, error: err };
       }
     });
@@ -973,9 +1027,13 @@ export default function Workspace({
 
       if (taskResult.status === 'fulfilled' && taskResult.value.success) {
         const { target, cleanHtml } = taskResult.value;
+        const now = Date.now();
         workingQuestions[target.index] = {
           ...workingQuestions[target.index],
-          answer: cleanHtml
+          answer: cleanHtml,
+          formattedByAI: true,
+          formattedModel: preferredModel,
+          formattedAt: now
         };
 
         // Live update of questions state
@@ -1041,12 +1099,24 @@ export default function Workspace({
 
     setSaveStatus('Saved ✓');
 
-    // 5. Toast summary with Retry failed button if any failed
+    // 5. Toast summary showing real counts
     const successCount = targets.length - failedTargets.length;
     const failedCount = failedTargets.length;
-    const toastMsg = failedCount > 0
-      ? `${successCount} formatted, ${failedCount} failed`
-      : `${successCount} formatted`;
+
+    const parts = [];
+    parts.push(`${successCount} formatted`);
+    if (skippedAlreadyCount > 0) {
+      parts.push(`${skippedAlreadyCount} skipped (already formatted)`);
+    }
+    if (skippedEmptyCount > 0) {
+      parts.push(`${skippedEmptyCount} skipped (empty)`);
+    }
+    if (failedCount > 0) {
+      parts.push(`${failedCount} failed`);
+    }
+
+    const toastMsg = parts.join(', ');
+    console.log(`[Format All] Batch finished: ${toastMsg}`);
 
     showFormatAllToast({
       message: toastMsg,
@@ -4346,46 +4416,75 @@ export default function Workspace({
             </button>
           )}
           {activeTab === 'create' && (
-            <button
-              className="btn-secondary"
-              onClick={() => handleFormatAll()}
-              disabled={isFormattingAll}
-              title="Auto-format all unformatted questions with AI"
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: '0.5rem',
-                cursor: isFormattingAll ? 'not-allowed' : 'pointer'
-              }}
-            >
-              {isFormattingAll ? (
-                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <span>{`Formatting ${formatAllProgress.current} of ${formatAllProgress.total}...`}</span>
-                  <span
-                    style={{
-                      display: 'inline-block',
-                      width: '40px',
-                      height: '6px',
-                      background: 'var(--border-color, #e2e8f0)',
-                      borderRadius: '3px',
-                      overflow: 'hidden'
-                    }}
-                  >
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem' }}>
+              <button
+                className="btn-secondary"
+                onClick={() => handleFormatAll()}
+                disabled={isFormattingAll}
+                title="Format all questions with Gemini AI (skips already formatted questions)"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  cursor: isFormattingAll ? 'not-allowed' : 'pointer'
+                }}
+              >
+                {isFormattingAll ? (
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <span>{`Formatting ${formatAllProgress.current} of ${formatAllProgress.total}...`}</span>
                     <span
                       style={{
-                        display: 'block',
-                        height: '100%',
-                        width: `${formatAllProgress.total ? Math.round((formatAllProgress.current / formatAllProgress.total) * 100) : 0}%`,
-                        background: 'var(--primary-color, #6366f1)',
-                        transition: 'width 0.2s ease'
+                        display: 'inline-block',
+                        width: '40px',
+                        height: '6px',
+                        background: 'var(--border-color, #e2e8f0)',
+                        borderRadius: '3px',
+                        overflow: 'hidden'
                       }}
-                    />
-                  </span>
-                </div>
-              ) : (
-                <span>Format All</span>
-              )}
-            </button>
+                    >
+                      <span
+                        style={{
+                          display: 'block',
+                          height: '100%',
+                          width: `${formatAllProgress.total ? Math.round((formatAllProgress.current / formatAllProgress.total) * 100) : 0}%`,
+                          background: 'var(--primary-color, #6366f1)',
+                          transition: 'width 0.2s ease'
+                        }}
+                      />
+                    </span>
+                  </div>
+                ) : (
+                  <span>Format All</span>
+                )}
+              </button>
+
+              <label
+                title="Force reformat all: ignores already-formatted flags and sends all non-empty questions to Gemini"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  fontSize: '0.78rem',
+                  color: forceReformatAll ? 'var(--text-main, #0f172a)' : 'var(--text-muted, #64748b)',
+                  cursor: isFormattingAll ? 'not-allowed' : 'pointer',
+                  userSelect: 'none',
+                  padding: '0.35rem 0.5rem',
+                  borderRadius: '6px',
+                  background: forceReformatAll ? 'rgba(99, 102, 241, 0.12)' : 'transparent',
+                  border: forceReformatAll ? '1px solid rgba(99, 102, 241, 0.35)' : '1px solid transparent',
+                  transition: 'all 0.15s ease'
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={forceReformatAll}
+                  onChange={(e) => setForceReformatAll(e.target.checked)}
+                  disabled={isFormattingAll}
+                  style={{ cursor: isFormattingAll ? 'not-allowed' : 'pointer', accentColor: '#6366f1' }}
+                />
+                <span>Force</span>
+              </label>
+            </div>
           )}
 
           {activeTab === 'create' && formatAllSnapshot && !isFormattingAll && (
