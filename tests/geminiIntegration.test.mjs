@@ -50,6 +50,9 @@ const {
   callGeminiGenerateContent,
   generateGeminiContent,
   formatNotesDirect,
+  formatBlockWithRetry,
+  isAlreadyFormatted,
+  runWithConcurrency,
   extractNotesDirect,
   getPreferredModel,
   setPreferredModel,
@@ -540,5 +543,223 @@ describe('Diagram Recognition & Hydration for GPT Paste', () => {
     const formatted = formatAnswerWithDiagrams(geminiHtml);
     assert.match(formatted, /class="mermaid-diagram-container"/);
     assert.match(formatted, /data-mermaid-code="graph%20LR/);
+  });
+});
+
+describe('Format All: Block Detection, Concurrency, and 429 Exponential Backoff', () => {
+  test('isAlreadyFormatted correctly identifies unformatted vs already-formatted content', () => {
+    // Empty cases
+    assert.equal(isAlreadyFormatted(''), false);
+    assert.equal(isAlreadyFormatted('   '), false);
+    assert.equal(isAlreadyFormatted('<p></p>'), false);
+    assert.equal(isAlreadyFormatted('<p><br></p>'), false);
+
+    // Unformatted plain content
+    assert.equal(isAlreadyFormatted('<p>Photosynthesis produces glucose from CO2 and water.</p>'), false);
+    assert.equal(isAlreadyFormatted('Just raw notes without structure or headings.'), false);
+
+    // Formatted content (contains headings and bullet/ordered lists)
+    assert.equal(
+      isAlreadyFormatted('<h2>Key Concepts</h2><ul><li>Point 1</li><li>Point 2</li></ul>'),
+      true
+    );
+    assert.equal(
+      isAlreadyFormatted('<h1>Title</h1><p>Intro</p><ol><li>Step A</li></ol>'),
+      true
+    );
+    assert.equal(
+      isAlreadyFormatted('## Overview\n- Three-way handshake\n- Flow control'),
+      true
+    );
+  });
+
+  test('runWithConcurrency runs at most 3 tasks at a time', async () => {
+    let activeTasks = 0;
+    let maxConcurrency = 0;
+    const completedTasks = [];
+
+    const tasks = Array.from({ length: 9 }, (_, i) => async () => {
+      activeTasks++;
+      if (activeTasks > maxConcurrency) maxConcurrency = activeTasks;
+      await new Promise(r => setTimeout(r, 20));
+      activeTasks--;
+      return `Result ${i}`;
+    });
+
+    const results = await runWithConcurrency(tasks, 3, (res, idx) => {
+      completedTasks.push({ res, idx });
+    });
+
+    assert.equal(results.length, 9);
+    assert.equal(completedTasks.length, 9);
+    assert.ok(maxConcurrency <= 3, `Max concurrency should not exceed 3, but was ${maxConcurrency}`);
+    assert.ok(maxConcurrency >= 2, `Concurrency should be parallel (at least 2, was ${maxConcurrency})`);
+  });
+
+  test('formatBlockWithRetry retries on 429 with exponential backoff and succeeds', async () => {
+    saveApiKey('AIzaSyValidKey', true);
+    let attempts = 0;
+
+    global.fetch = async () => {
+      attempts++;
+      if (attempts < 3) {
+        // Return 429 on first 2 attempts
+        return {
+          ok: false,
+          status: 429,
+          json: async () => ({
+            error: {
+              code: 429,
+              message: 'Resource exhausted / quota rate limit reached',
+              status: 'RESOURCE_EXHAUSTED'
+            }
+          })
+        };
+      }
+      // Succeeds on 3rd attempt
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [{ text: '<h2>Formatted Note</h2><ul><li>Point A</li></ul>' }]
+              }
+            }
+          ]
+        })
+      };
+    };
+
+    const result = await formatBlockWithRetry({
+      text: 'Unformatted text for retry test',
+      model: 'gemini-3.6-flash'
+    });
+
+    assert.match(result, /<h2>Formatted Note<\/h2>/);
+    assert.equal(attempts, 3, 'Should have retried twice and succeeded on 3rd attempt');
+  });
+
+  test('Format All simulation: 10+ questions, 1 already formatted, 1 empty, and 1 persistent 429 error', async () => {
+    saveApiKey('AIzaSyValidKey', true);
+
+    // Setup 11 questions
+    // Q0: Empty
+    // Q1: Already formatted
+    // Q2..Q9: Unformatted normal
+    // Q10: Simulated persistent 429 failure
+    const rawQuestions = [
+      { question: 'Q0', answer: '<p><br></p>' },
+      { question: 'Q1', answer: '<h2>Existing</h2><ul><li>Already formatted</li></ul>' },
+      ...Array.from({ length: 8 }, (_, i) => ({
+        question: `Question ${i + 2}`,
+        answer: `<p>Unformatted raw draft answer ${i + 2}</p>`
+      })),
+      { question: 'Q10', answer: '<p>Unformatted text that hits persistent 429</p>' }
+    ];
+
+    assert.equal(rawQuestions.length, 11);
+
+    // Filter targets exactly as Workspace handleFormatAll does
+    const targets = [];
+    rawQuestions.forEach((block, idx) => {
+      const ans = block.answer || '';
+      const textOnly = ans.replace(/<[^>]*>/g, '').trim();
+      if (!textOnly) return; // skip empty
+      if (isAlreadyFormatted(ans)) return; // skip already formatted
+      targets.push({ index: idx, text: ans });
+    });
+
+    // Should skip Q0 (empty) and Q1 (already formatted), leaving 9 targets
+    assert.equal(targets.length, 9);
+    assert.equal(targets.some(t => t.index === 0), false, 'Q0 should be skipped');
+    assert.equal(targets.some(t => t.index === 1), false, 'Q1 should be skipped');
+
+    // Mock fetch for targets
+    global.fetch = async (url, options) => {
+      const body = JSON.parse(options.body);
+      const text = body.contents[0].parts[0].text;
+
+      if (text.includes('persistent 429')) {
+        return {
+          ok: false,
+          status: 429,
+          json: async () => ({
+            error: {
+              code: 429,
+              message: 'Rate limit exceeded',
+              status: 'RESOURCE_EXHAUSTED'
+            }
+          })
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [{ text: `<h2>Formatted Answer</h2><ul><li>Structured point</li></ul>` }]
+              }
+            }
+          ]
+        })
+      };
+    };
+
+    // Execute runWithConcurrency
+    const workingQuestions = [...rawQuestions];
+    const failedTargets = [];
+    let completedCount = 0;
+
+    const tasks = targets.map((target) => async () => {
+      try {
+        const clean = await formatBlockWithRetry({
+          text: target.text,
+          model: 'gemini-3.6-flash'
+        });
+        return { success: true, target, clean };
+      } catch (err) {
+        return { success: false, target, error: err };
+      }
+    });
+
+    await runWithConcurrency(tasks, 3, (taskResult) => {
+      completedCount++;
+      if (taskResult.status === 'fulfilled' && taskResult.value.success) {
+        const { target, clean } = taskResult.value;
+        workingQuestions[target.index] = {
+          ...workingQuestions[target.index],
+          answer: clean
+        };
+      } else {
+        const item = taskResult.status === 'fulfilled' ? taskResult.value.target : null;
+        if (item) failedTargets.push(item);
+      }
+    });
+
+    assert.equal(completedCount, 9);
+    // 8 should succeed, 1 should fail (Q10)
+    assert.equal(failedTargets.length, 1);
+    assert.equal(failedTargets[0].index, 10);
+
+    // Q0 untouched (empty)
+    assert.equal(workingQuestions[0].answer, '<p><br></p>');
+    // Q1 untouched (already formatted)
+    assert.equal(workingQuestions[1].answer, '<h2>Existing</h2><ul><li>Already formatted</li></ul>');
+    // Q2..Q9 formatted
+    for (let i = 2; i <= 9; i++) {
+      assert.match(workingQuestions[i].answer, /<h2>Formatted Answer<\/h2>/);
+    }
+    // Q10 original text untouched on failure
+    assert.equal(workingQuestions[10].answer, '<p>Unformatted text that hits persistent 429</p>');
+
+    // Summary toast message matches requirement
+    const successCount = targets.length - failedTargets.length;
+    const toastMsg = `${successCount} formatted, ${failedTargets.length} failed`;
+    assert.equal(toastMsg, '8 formatted, 1 failed');
   });
 });

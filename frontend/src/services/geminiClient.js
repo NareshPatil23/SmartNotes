@@ -531,6 +531,88 @@ INSTRUCTIONS:
 }
 
 /**
+ * Returns true if the HTML string is already "rich" (contains headings and bullet lists),
+ * indicating it has already been AI-formatted.
+ */
+export function isAlreadyFormatted(html) {
+  if (!html || typeof html !== 'string') return false;
+  const stripped = html.replace(/<[^>]*>/g, '').trim();
+  if (!stripped) return false;
+
+  const hasHtmlHeading = /<h[1-6][\s>]/i.test(html);
+  const hasHtmlList = /<(ul|ol)[\s>]/i.test(html);
+  const hasMdHeading = /(^|\n)#{1,6}\s+\S+/m.test(html);
+  const hasMdList = /(^|\n)\s*[-*+]\s+\S+/m.test(html);
+
+  const hasHeading = hasHtmlHeading || hasMdHeading;
+  const hasList = hasHtmlList || hasMdList;
+
+  return hasHeading && hasList;
+}
+
+/**
+ * Format a single text/HTML block with up to 3 retries on HTTP 429.
+ * Exponential backoff: 1 s → 2 s → 4 s.
+ * Uses the same formatNotesDirect call and model config as Auto Format.
+ *
+ * @param {{ text: string, isHandwritten?: boolean, model?: string, apiKey?: string }} opts
+ * @returns {Promise<string>} formatted HTML
+ */
+export async function formatBlockWithRetry({ text, isHandwritten = false, model = null, apiKey = null }) {
+  const MAX_RETRIES = 3;
+  let delay = 1000;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await formatNotesDirect({ text, isHandwritten, model, apiKey });
+    } catch (err) {
+      const is429 = err.status === 429 ||
+        (err.message || '').toLowerCase().includes('quota') ||
+        (err.message || '').toLowerCase().includes('rate limit') ||
+        (err.message || '').toLowerCase().includes('resource_exhausted') ||
+        (err.message || '').toLowerCase().includes('429');
+
+      if (is429 && attempt < MAX_RETRIES) {
+        await new Promise(r => setTimeout(r, delay));
+        delay *= 2;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Concurrency worker runner for processing asynchronous tasks with a concurrency limit.
+ * As each task completes, onTaskComplete(result, taskIndex) is fired immediately.
+ */
+export async function runWithConcurrency(tasks, limit = 3, onTaskComplete = null) {
+  if (!Array.isArray(tasks) || tasks.length === 0) return [];
+  let nextIndex = 0;
+  const results = new Array(tasks.length);
+
+  async function worker() {
+    while (nextIndex < tasks.length) {
+      const currentIndex = nextIndex++;
+      try {
+        const val = await tasks[currentIndex]();
+        results[currentIndex] = { status: 'fulfilled', value: val };
+      } catch (err) {
+        results[currentIndex] = { status: 'rejected', reason: err };
+      }
+      if (typeof onTaskComplete === 'function') {
+        onTaskComplete(results[currentIndex], currentIndex);
+      }
+    }
+  }
+
+  const workerCount = Math.min(limit, tasks.length);
+  const workers = Array.from({ length: workerCount }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+/**
  * Extract Q&A study notes directly in the browser
  */
 export async function extractNotesDirect({ text, inlineData = null, model = null, apiKey = null }) {

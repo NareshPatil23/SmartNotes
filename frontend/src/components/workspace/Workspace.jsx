@@ -11,6 +11,9 @@ import {
   handleLogoutKeyCleanup,
   validateGeminiApiKey,
   formatNotesDirect,
+  formatBlockWithRetry,
+  isAlreadyFormatted,
+  runWithConcurrency,
   askPdfChatDirect,
   extractNotesDirect,
   generateGeminiContent,
@@ -135,6 +138,13 @@ export default function Workspace({
   const [formatInput, setFormatInput] = useState('')
   const [formatOutput, setFormatOutput] = useState('')
   const [isFormattingTab, setIsFormattingTab] = useState(false)
+
+  // Format All States
+  const [isFormattingAll, setIsFormattingAll] = useState(false)
+  const [formatAllProgress, setFormatAllProgress] = useState({ current: 0, total: 0 })
+  const [formatAllSnapshot, setFormatAllSnapshot] = useState(null)
+  const [formatAllToast, setFormatAllToast] = useState(null)
+  const formatAllToastTimerRef = useRef(null)
 
   // Summarize Section States
   const [summarizeInput, setSummarizeInput] = useState('')
@@ -810,11 +820,40 @@ export default function Workspace({
     }, 500);
   };
 
+  // Shared block formatter used by both Auto Format and Format All
+  const formatBlock = useCallback(async (text, keyOverride = null) => {
+    const key = keyOverride || getStoredApiKey();
+    if (!key) {
+      const err = new Error('No Gemini API key found. Please add your API key in Settings.');
+      err.code = 'NO_API_KEY';
+      throw err;
+    }
+
+    const rawHtml = await formatBlockWithRetry({
+      text,
+      isHandwritten: isHandwrittenMode,
+      model: preferredModel,
+      apiKey: key
+    });
+
+    const formattedHtml = formatAnswerWithDiagrams(rawHtml);
+    return DOMPurify.sanitize(formattedHtml);
+  }, [isHandwrittenMode, preferredModel]);
+
+  const showFormatAllToast = (toastData) => {
+    if (formatAllToastTimerRef.current) clearTimeout(formatAllToastTimerRef.current);
+    setFormatAllToast(toastData);
+    const timeout = toastData.failedTargets && toastData.failedTargets.length > 0 ? 15000 : 8000;
+    formatAllToastTimerRef.current = setTimeout(() => {
+      setFormatAllToast(null);
+    }, timeout);
+  };
+
   const handleAutoFormat = async () => {
     const currentContent = richEditorRef.current ? richEditorRef.current.getContent() : answerText;
     if (!currentContent.trim()) return;
 
-    // Requirement 6: Check for user's Gemini key in storage
+    // Check for user's Gemini key in storage
     const key = getStoredApiKey();
     if (!key) {
       setShowKeyModal(true);
@@ -825,17 +864,8 @@ export default function Workspace({
     setSaveStatus('AI Thinking...');
     
     try {
-      // Direct browser-to-Gemini API call
-      const rawHtml = await formatNotesDirect({
-        text: currentContent,
-        isHandwritten: isHandwrittenMode,
-        model: preferredModel,
-        apiKey: key
-      });
-
-      // Format diagrams & sanitize AI output with DOMPurify
-      const formattedHtml = formatAnswerWithDiagrams(rawHtml);
-      const cleanHtml = DOMPurify.sanitize(formattedHtml);
+      // Shared block formatter
+      const cleanHtml = await formatBlock(currentContent, key);
       
       setAnswerText(cleanHtml);
       if (richEditorRef.current) {
@@ -856,6 +886,217 @@ export default function Workspace({
       setIsFormatting(false);
       setSaveStatus('Saved');
     }
+  };
+
+  const handleFormatAll = async (retryTargets = null) => {
+    if (isFormattingAll) return;
+
+    const key = getStoredApiKey();
+    if (!key) {
+      setShowKeyModal(true);
+      return;
+    }
+
+    // 1. Sync current editor content into questions list
+    const currentContent = richEditorRef.current ? richEditorRef.current.getContent() : answerText;
+    let allBlocks = [...questions];
+    const currentQ = {
+      number: autoNumbering ? activeQuestionIdx + 1 : questionNumber,
+      question: questionText,
+      answer: currentContent,
+      marks: marksText
+    };
+    if (activeQuestionIdx < allBlocks.length) {
+      allBlocks[activeQuestionIdx] = currentQ;
+    } else if (questionText.trim() || currentContent.trim()) {
+      allBlocks.push(currentQ);
+    }
+
+    if (allBlocks.length === 0) {
+      showAiErrorToast("No questions in the open note to format.");
+      return;
+    }
+
+    // 2. Take a snapshot before running so one click of Undo restores everything
+    if (!retryTargets) {
+      setFormatAllSnapshot({
+        questions: JSON.parse(JSON.stringify(allBlocks)),
+        activeQuestionIdx,
+        questionText,
+        answerText: currentContent
+      });
+    }
+
+    // 3. Determine targets to format (skip empty or already formatted)
+    let targets = [];
+    if (Array.isArray(retryTargets) && retryTargets.length > 0) {
+      targets = retryTargets;
+    } else {
+      allBlocks.forEach((block, idx) => {
+        const ans = block.answer || '';
+        const stripped = ans.replace(/<[^>]*>/g, '').trim();
+        if (!stripped) return; // skip empty
+        if (isAlreadyFormatted(ans)) return; // skip already formatted
+        targets.push({ index: idx, text: ans });
+      });
+    }
+
+    if (targets.length === 0) {
+      showFormatAllToast({
+        message: 'All blocks are already formatted or empty.',
+        failedTargets: []
+      });
+      return;
+    }
+
+    setIsFormattingAll(true);
+    setFormatAllProgress({ current: 0, total: targets.length });
+    setSaveStatus('Formatting All with AI...');
+    setFormatAllToast(null);
+
+    const workingQuestions = [...allBlocks];
+    let completedCount = 0;
+    const failedTargets = [];
+
+    const tasks = targets.map((target) => async () => {
+      try {
+        const cleanHtml = await formatBlock(target.text, key);
+        return { success: true, target, cleanHtml };
+      } catch (err) {
+        return { success: false, target, error: err };
+      }
+    });
+
+    await runWithConcurrency(tasks, 3, (taskResult) => {
+      completedCount++;
+      setFormatAllProgress({ current: completedCount, total: targets.length });
+
+      if (taskResult.status === 'fulfilled' && taskResult.value.success) {
+        const { target, cleanHtml } = taskResult.value;
+        workingQuestions[target.index] = {
+          ...workingQuestions[target.index],
+          answer: cleanHtml
+        };
+
+        // Live update of questions state
+        setQuestions([...workingQuestions]);
+
+        // If the active editor is on this question, update editor live
+        if (target.index === activeQuestionIdx) {
+          setAnswerText(cleanHtml);
+          if (richEditorRef.current) {
+            richEditorRef.current.setContent(cleanHtml);
+          }
+        }
+
+        // Live hydrate diagrams in preview
+        if (previewRef.current) {
+          hydrateMermaidContainers(previewRef.current, isDarkMode);
+        }
+      } else {
+        // Leave original text untouched on failure
+        const item = taskResult.status === 'fulfilled' ? taskResult.value.target : null;
+        if (item) failedTargets.push(item);
+      }
+    });
+
+    setIsFormattingAll(false);
+
+    // 4. Trigger auto-save ONCE at the end
+    try {
+      const activeAns = workingQuestions[activeQuestionIdx]?.answer || currentContent;
+      const draftData = {
+        id: currentNoteId,
+        title: docTitle || 'Untitled Note',
+        lastEdited: Date.now(),
+        status: noteStatus,
+        data: {
+          docTitle,
+          docSubtitle,
+          questionText,
+          answerText: activeAns,
+          marksText,
+          autoNumbering,
+          questionNumber,
+          questions: workingQuestions,
+          activeQuestionIdx
+        }
+      };
+
+      setDrafts(prev => {
+        const existingIdx = prev.findIndex(d => d.id === currentNoteId);
+        let newDrafts;
+        if (existingIdx >= 0) {
+          newDrafts = [...prev];
+          newDrafts[existingIdx] = draftData;
+        } else {
+          newDrafts = [draftData, ...prev];
+        }
+        localStorage.setItem('smartnotes_drafts', JSON.stringify(newDrafts));
+        return newDrafts.sort((a, b) => b.lastEdited - a.lastEdited);
+      });
+    } catch (e) {
+      console.warn('[Format All] Auto-save error:', e);
+    }
+
+    setSaveStatus('Saved ✓');
+
+    // 5. Toast summary with Retry failed button if any failed
+    const successCount = targets.length - failedTargets.length;
+    const failedCount = failedTargets.length;
+    const toastMsg = failedCount > 0
+      ? `${successCount} formatted, ${failedCount} failed`
+      : `${successCount} formatted`;
+
+    showFormatAllToast({
+      message: toastMsg,
+      failedTargets,
+      canUndo: true
+    });
+  };
+
+  const handleUndoFormatAll = () => {
+    if (!formatAllSnapshot) return;
+    setQuestions(formatAllSnapshot.questions);
+    setActiveQuestionIdx(formatAllSnapshot.activeQuestionIdx);
+    setQuestionText(formatAllSnapshot.questionText);
+    setAnswerText(formatAllSnapshot.answerText);
+    if (richEditorRef.current) {
+      richEditorRef.current.setContent(formatAllSnapshot.answerText);
+    }
+
+    try {
+      const draftData = {
+        id: currentNoteId,
+        title: docTitle || 'Untitled Note',
+        lastEdited: Date.now(),
+        status: noteStatus,
+        data: {
+          docTitle,
+          docSubtitle,
+          questionText: formatAllSnapshot.questionText,
+          answerText: formatAllSnapshot.answerText,
+          marksText,
+          autoNumbering,
+          questionNumber,
+          questions: formatAllSnapshot.questions,
+          activeQuestionIdx: formatAllSnapshot.activeQuestionIdx
+        }
+      };
+      setDrafts(prev => {
+        const existingIdx = prev.findIndex(d => d.id === currentNoteId);
+        let newDrafts = existingIdx >= 0 ? [...prev] : [draftData, ...prev];
+        if (existingIdx >= 0) newDrafts[existingIdx] = draftData;
+        localStorage.setItem('smartnotes_drafts', JSON.stringify(newDrafts));
+        return newDrafts.sort((a, b) => b.lastEdited - a.lastEdited);
+      });
+    } catch (e) {
+      console.warn('[Undo Format All] Save error:', e);
+    }
+
+    setFormatAllSnapshot(null);
+    setFormatAllToast(null);
+    setSaveStatus('Format All Undone ✓');
   };
 
   const handleUpload = async (e) => {
@@ -4104,6 +4345,65 @@ export default function Workspace({
               ✓ End Edit
             </button>
           )}
+          {activeTab === 'create' && (
+            <button
+              className="btn-secondary"
+              onClick={() => handleFormatAll()}
+              disabled={isFormattingAll}
+              title="Auto-format all unformatted questions with AI"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.5rem',
+                cursor: isFormattingAll ? 'not-allowed' : 'pointer'
+              }}
+            >
+              {isFormattingAll ? (
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <span>{`Formatting ${formatAllProgress.current} of ${formatAllProgress.total}...`}</span>
+                  <span
+                    style={{
+                      display: 'inline-block',
+                      width: '40px',
+                      height: '6px',
+                      background: 'var(--border-color, #e2e8f0)',
+                      borderRadius: '3px',
+                      overflow: 'hidden'
+                    }}
+                  >
+                    <span
+                      style={{
+                        display: 'block',
+                        height: '100%',
+                        width: `${formatAllProgress.total ? Math.round((formatAllProgress.current / formatAllProgress.total) * 100) : 0}%`,
+                        background: 'var(--primary-color, #6366f1)',
+                        transition: 'width 0.2s ease'
+                      }}
+                    />
+                  </span>
+                </div>
+              ) : (
+                <span>Format All</span>
+              )}
+            </button>
+          )}
+
+          {activeTab === 'create' && formatAllSnapshot && !isFormattingAll && (
+            <button
+              className="btn-secondary"
+              onClick={handleUndoFormatAll}
+              title="Restore questions to state before Format All"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.4rem',
+                cursor: 'pointer'
+              }}
+            >
+              ↩ Undo Format All
+            </button>
+          )}
+
           <button 
             className={isExporting ? "btn-danger" : "btn-primary"} 
             onClick={isExporting ? cancelExportPDF : exportPDF}
@@ -5095,6 +5395,88 @@ export default function Workspace({
             </button>
             <button
               onClick={() => setAiErrorToast(null)}
+              style={{
+                background: 'transparent',
+                color: '#94a3b8',
+                border: 'none',
+                borderRadius: '6px',
+                padding: '0.3rem 0.5rem',
+                fontSize: '1rem',
+                cursor: 'pointer',
+                lineHeight: 1
+              }}
+              aria-label="Dismiss"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Inline Format All Toast — minimal, neutral styling with Retry failed and Undo buttons */}
+      {formatAllToast && (
+        <div style={{
+          position: 'fixed',
+          bottom: '1.5rem',
+          right: '1.5rem',
+          zIndex: 9999,
+          background: '#1e293b',
+          color: '#f8fafc',
+          padding: '0.75rem 1rem',
+          borderRadius: '10px',
+          fontSize: '0.875rem',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.75rem',
+          boxShadow: '0 4px 24px rgba(0,0,0,0.3)',
+          maxWidth: '460px',
+          lineHeight: '1.4'
+        }}>
+          <span>{formatAllToast.failedTargets && formatAllToast.failedTargets.length > 0 ? '⚠️' : '✓'} {formatAllToast.message}</span>
+          <div style={{ display: 'flex', gap: '0.5rem', flexShrink: 0, alignItems: 'center' }}>
+            {formatAllToast.failedTargets && formatAllToast.failedTargets.length > 0 && (
+              <button
+                onClick={() => {
+                  const toRetry = formatAllToast.failedTargets;
+                  setFormatAllToast(null);
+                  handleFormatAll(toRetry);
+                }}
+                style={{
+                  background: '#6366f1',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: '6px',
+                  padding: '0.3rem 0.65rem',
+                  fontSize: '0.8rem',
+                  cursor: 'pointer',
+                  whiteSpace: 'nowrap'
+                }}
+              >
+                Retry failed
+              </button>
+            )}
+            {formatAllToast.canUndo && formatAllSnapshot && (
+              <button
+                onClick={() => {
+                  handleUndoFormatAll();
+                  setFormatAllToast(null);
+                }}
+                style={{
+                  background: 'transparent',
+                  color: '#cbd5e1',
+                  border: '1px solid #475569',
+                  borderRadius: '6px',
+                  padding: '0.3rem 0.65rem',
+                  fontSize: '0.8rem',
+                  cursor: 'pointer',
+                  whiteSpace: 'nowrap'
+                }}
+              >
+                Undo
+              </button>
+            )}
+            <button
+              onClick={() => setFormatAllToast(null)}
               style={{
                 background: 'transparent',
                 color: '#94a3b8',
