@@ -186,6 +186,15 @@ export default function Workspace({
   const [testStatus, setTestStatus] = useState({ type: '', message: '' })
   const [isTestingConnection, setIsTestingConnection] = useState(false)
 
+  // Inline AI error toast (replaces browser alert for Gemini errors)
+  const [aiErrorToast, setAiErrorToast] = useState(null) // { message: string } | null
+  const aiToastTimerRef = useRef(null)
+  const showAiErrorToast = useCallback((message) => {
+    if (aiToastTimerRef.current) clearTimeout(aiToastTimerRef.current)
+    setAiErrorToast({ message })
+    aiToastTimerRef.current = setTimeout(() => setAiErrorToast(null), 8000)
+  }, [])
+
   // Listen for automatic model fallback events
   useEffect(() => {
     const handleModelFallback = (e) => {
@@ -246,6 +255,12 @@ export default function Workspace({
       setKeyRemembered(isRemembered());
       setHasByokKey(true);
     }
+
+    // On-load model validation: if the saved preferred model is not in the
+    // known-valid list (e.g. an old 'gemini-3.8-flash' value), reset it to default.
+    const resolvedOnLoad = getPreferredModel(); // resolvePreferredModel handles obsolete IDs
+    setPreferredModel(resolvedOnLoad);
+    savePreferredModelStorage(resolvedOnLoad);
   }, []);
 
   const handleKeySaved = (savedKey, models) => {
@@ -836,7 +851,7 @@ export default function Workspace({
       if (error.code === 'NO_API_KEY') {
         setShowKeyModal(true);
       } else {
-        alert(error.message || 'AI Formatting failed. Please check your Gemini API key in Settings.');
+        showAiErrorToast(error.message || 'AI Formatting failed. Please check your Gemini API key in Settings.');
       }
       setIsFormatting(false);
       setSaveStatus('Saved');
@@ -2393,7 +2408,7 @@ export default function Workspace({
                 if (err.code === 'NO_API_KEY') {
                   setShowKeyModal(true);
                 } else {
-                  alert("Format failed: " + (err.message || "Unknown error"));
+                  showAiErrorToast("Format failed: " + (err.message || "Unknown error"));
                 }
               } finally {
                 setIsFormattingTab(false);
@@ -2660,7 +2675,7 @@ export default function Workspace({
                 if (err.code === 'NO_API_KEY') {
                   setShowKeyModal(true);
                 } else {
-                  alert("Summary failed: " + (err.message || "Unknown error"));
+                  showAiErrorToast("Summary failed: " + (err.message || "Unknown error"));
                 }
               } finally {
                 setIsSummarizing(false);
@@ -5041,6 +5056,62 @@ export default function Workspace({
         onClose={() => setShowKeyModal(false)}
         onKeySaved={handleKeySaved}
       />
+
+      {/* Inline AI error toast — replaces browser alert() for Gemini errors */}
+      {aiErrorToast && (
+        <div style={{
+          position: 'fixed',
+          bottom: '1.5rem',
+          right: '1.5rem',
+          zIndex: 9999,
+          background: '#1e293b',
+          color: '#f8fafc',
+          padding: '0.75rem 1rem',
+          borderRadius: '10px',
+          fontSize: '0.875rem',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.75rem',
+          boxShadow: '0 4px 24px rgba(0,0,0,0.3)',
+          maxWidth: '420px',
+          lineHeight: '1.4'
+        }}>
+          <span>⚠️ {aiErrorToast.message}</span>
+          <div style={{ display: 'flex', gap: '0.5rem', flexShrink: 0 }}>
+            <button
+              onClick={() => { setActiveTab('settings'); setAiErrorToast(null); }}
+              style={{
+                background: '#6366f1',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '6px',
+                padding: '0.3rem 0.65rem',
+                fontSize: '0.8rem',
+                cursor: 'pointer',
+                whiteSpace: 'nowrap'
+              }}
+            >
+              Change model
+            </button>
+            <button
+              onClick={() => setAiErrorToast(null)}
+              style={{
+                background: 'transparent',
+                color: '#94a3b8',
+                border: 'none',
+                borderRadius: '6px',
+                padding: '0.3rem 0.5rem',
+                fontSize: '1rem',
+                cursor: 'pointer',
+                lineHeight: 1
+              }}
+              aria-label="Dismiss"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

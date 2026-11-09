@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
   user_id VARCHAR(64) UNIQUE REFERENCES users(id) ON DELETE CASCADE,
   ai_provider VARCHAR(32) DEFAULT 'platform',
   encrypted_byok_key TEXT,
-  preferred_model VARCHAR(64) DEFAULT 'gemini-3.8-flash',
+  preferred_model VARCHAR(64) DEFAULT 'gemini-3.6-flash',
   default_theme VARCHAR(32) DEFAULT 'default',
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

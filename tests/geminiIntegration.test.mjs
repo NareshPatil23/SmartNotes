@@ -75,36 +75,43 @@ const {
 } = await import('../frontend/src/utils/mermaidHelper.js');
 
 describe('Gemini Model Configuration & Central Architecture', () => {
-  test('Central configuration defaults to gemini-3.8-flash and ordered fallbacks', () => {
-    assert.equal(DEFAULT_GEMINI_MODEL, 'gemini-3.8-flash');
+  test('Central configuration defaults to gemini-3.6-flash and ordered fallbacks', () => {
+    assert.equal(DEFAULT_GEMINI_MODEL, 'gemini-3.6-flash');
     assert.deepEqual(GEMINI_FALLBACK_MODELS, [
-      'gemini-3.8-flash',
-      'gemini-3.8-flash-lite',
-      'gemini-3.1-flash-lite'
+      'gemini-3.6-flash',
+      'gemini-3.7-flash',
+      'gemini-3.5-flash-lite',
+      'gemini-3.1-flash-lite',
+      'gemini-2.5-flash'
     ]);
   });
 
   test('resolvePreferredModel safely handles legacy or retired models by falling back to default', () => {
-    // Legacy models that no longer exist for new projects
-    assert.equal(resolvePreferredModel('gemini-2.5-flash'), 'gemini-3.8-flash');
-    assert.equal(resolvePreferredModel('gemini-1.5-flash'), 'gemini-3.8-flash');
-    assert.equal(resolvePreferredModel('gemini-2.0-flash'), 'gemini-3.8-flash');
-    assert.equal(resolvePreferredModel(null), 'gemini-3.8-flash');
+    // gemini-3.8-* does not exist — treat as obsolete
+    assert.equal(resolvePreferredModel('gemini-3.8-flash'), 'gemini-3.6-flash');
+    assert.equal(resolvePreferredModel('gemini-3.8-flash-lite'), 'gemini-3.6-flash');
+    // Other retired models
+    assert.equal(resolvePreferredModel('gemini-1.5-flash'), 'gemini-3.6-flash');
+    assert.equal(resolvePreferredModel('gemini-2.0-flash'), 'gemini-3.6-flash');
+    assert.equal(resolvePreferredModel(null), 'gemini-3.6-flash');
 
-    // Valid modern model
-    assert.equal(resolvePreferredModel('gemini-3.8-flash'), 'gemini-3.8-flash');
-    assert.equal(resolvePreferredModel('gemini-3.8-flash-lite'), 'gemini-3.8-flash-lite');
+    // Valid modern models pass through
+    assert.equal(resolvePreferredModel('gemini-3.6-flash'), 'gemini-3.6-flash');
+    assert.equal(resolvePreferredModel('gemini-3.7-flash'), 'gemini-3.7-flash');
+    assert.equal(resolvePreferredModel('gemini-3.5-flash-lite'), 'gemini-3.5-flash-lite');
+    assert.equal(resolvePreferredModel('gemini-3.1-flash-lite'), 'gemini-3.1-flash-lite');
 
-    // Filter against available models list
-    const available = [{ id: 'gemini-3.8-flash-lite', name: 'Lite' }];
-    assert.equal(resolvePreferredModel('gemini-2.5-flash', available), 'gemini-3.8-flash-lite');
+    // Filter against available models list — falls to first match
+    const available = [{ id: 'gemini-3.5-flash-lite', name: 'Lite' }];
+    assert.equal(resolvePreferredModel('gemini-3.8-flash', available), 'gemini-3.5-flash-lite');
   });
 
   test('getNextFallbackModel walks the fallback chain in order', () => {
-    assert.equal(getNextFallbackModel('gemini-3.8-flash'), 'gemini-3.8-flash-lite');
-    assert.equal(getNextFallbackModel('gemini-3.8-flash-lite'), 'gemini-3.1-flash-lite');
-    // If on retired model not in list, returns first fallback
-    assert.equal(getNextFallbackModel('gemini-2.5-flash'), 'gemini-3.8-flash');
+    assert.equal(getNextFallbackModel('gemini-3.6-flash'), 'gemini-3.7-flash');
+    assert.equal(getNextFallbackModel('gemini-3.7-flash'), 'gemini-3.5-flash-lite');
+    assert.equal(getNextFallbackModel('gemini-3.5-flash-lite'), 'gemini-3.1-flash-lite');
+    // If on a model not in the list, returns first fallback
+    assert.equal(getNextFallbackModel('gemini-3.8-flash'), 'gemini-3.6-flash');
   });
 
   test('sanitizeGenerationConfig strips model-specific reasoning/thinking options', () => {
@@ -143,14 +150,14 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
         json: async () => ({
           models: [
             {
-              name: 'models/gemini-3.8-flash',
-              displayName: 'Gemini 3.8 Flash',
+              name: 'models/gemini-3.6-flash',
+              displayName: 'Gemini 3.6 Flash',
               description: 'Fast versatile model',
               supportedGenerationMethods: ['generateContent', 'countTokens']
             },
             {
-              name: 'models/gemini-3.8-flash-lite',
-              displayName: 'Gemini 3.8 Flash Lite',
+              name: 'models/gemini-3.5-flash-lite',
+              displayName: 'Gemini 3.5 Flash Lite',
               description: 'Lightweight model',
               supportedGenerationMethods: ['generateContent']
             },
@@ -168,8 +175,8 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
     const res = await validateGeminiApiKey('AIzaSyTestValidKey123');
     assert.equal(res.valid, true);
     assert.equal(res.models.length, 2);
-    assert.equal(res.models[0].id, 'gemini-3.8-flash');
-    assert.equal(res.models[1].id, 'gemini-3.8-flash-lite');
+    assert.equal(res.models[0].id, 'gemini-3.6-flash');
+    assert.equal(res.models[1].id, 'gemini-3.5-flash-lite');
 
     // Confirm it used the GET /v1beta/models endpoint without query param key
     assert.equal(capturedUrl, 'https://generativelanguage.googleapis.com/v1beta/models');
@@ -179,7 +186,7 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
     // Confirm available models saved to browser storage
     const stored = getAvailableModels();
     assert.equal(stored.length, 2);
-    assert.equal(stored[0].id, 'gemini-3.8-flash');
+    assert.equal(stored[0].id, 'gemini-3.6-flash');
   });
 
   test('Test 2: Invalid key (400 / 401) produces friendly error', async () => {
@@ -246,19 +253,20 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
       fallbackNotified = e.detail;
     });
 
+    // Simulate: gemini-3.6-flash returns 404 (retired for this key), gemini-3.7-flash succeeds
     global.fetch = async (url, options) => {
       const match = url.match(/models\/([^:]+):generateContent/);
       const model = match ? match[1] : '';
       attemptedModels.push(model);
 
-      if (model === 'gemini-3.8-flash') {
+      if (model === 'gemini-3.6-flash') {
         return {
           ok: false,
           status: 404,
           json: async () => ({
             error: {
               code: 404,
-              message: 'This model models/gemini-3.8-flash is no longer available to new users. Please update your code to use models/gemini-3.8-flash-lite.',
+              message: 'This model models/gemini-3.6-flash is no longer available to new users. Please update your code to use models/gemini-3.7-flash.',
               status: 'NOT_FOUND'
             }
           })
@@ -282,23 +290,23 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
     };
 
     saveApiKey('AIzaSyWorkingFallbackKey', true);
-    setPreferredModel('gemini-3.8-flash');
+    setPreferredModel('gemini-3.6-flash');
 
     const result = await generateGeminiContent({
       prompt: 'Format this lecture',
-      model: 'gemini-3.8-flash'
+      model: 'gemini-3.6-flash'
     });
 
     assert.equal(result, 'Generated notes from fallback model.');
-    assert.deepEqual(attemptedModels, ['gemini-3.8-flash', 'gemini-3.8-flash-lite']);
+    assert.deepEqual(attemptedModels, ['gemini-3.6-flash', 'gemini-3.7-flash']);
 
     // Check that working model was remembered
-    assert.equal(getPreferredModel(), 'gemini-3.8-flash-lite');
+    assert.equal(getPreferredModel(), 'gemini-3.7-flash');
 
     // Check fallback event notification
     assert.ok(fallbackNotified);
-    assert.equal(fallbackNotified.fromModel, 'gemini-3.8-flash');
-    assert.equal(fallbackNotified.toModel, 'gemini-3.8-flash-lite');
+    assert.equal(fallbackNotified.fromModel, 'gemini-3.6-flash');
+    assert.equal(fallbackNotified.toModel, 'gemini-3.7-flash');
   });
 
   test('Test 5b: 503 High demand automatically retries once with fallback and remembers working model', async () => {
@@ -314,7 +322,7 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
       const model = match ? match[1] : '';
       attemptedModels.push(model);
 
-      if (model === 'gemini-3.8-flash') {
+      if (model === 'gemini-3.6-flash') {
         return {
           ok: false,
           status: 503,
@@ -345,23 +353,23 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
     };
 
     saveApiKey('AIzaSyWorking503FallbackKey', true);
-    setPreferredModel('gemini-3.8-flash');
+    setPreferredModel('gemini-3.6-flash');
 
     const result = await generateGeminiContent({
       prompt: 'Format this note',
-      model: 'gemini-3.8-flash'
+      model: 'gemini-3.6-flash'
     });
 
     assert.equal(result, 'Formatted notes generated via fallback model.');
-    assert.deepEqual(attemptedModels, ['gemini-3.8-flash', 'gemini-3.8-flash-lite']);
+    assert.deepEqual(attemptedModels, ['gemini-3.6-flash', 'gemini-3.7-flash']);
 
     // Working model is remembered
-    assert.equal(getPreferredModel(), 'gemini-3.8-flash-lite');
+    assert.equal(getPreferredModel(), 'gemini-3.7-flash');
 
     // Check fallback notification
     assert.ok(fallbackNotified);
-    assert.equal(fallbackNotified.fromModel, 'gemini-3.8-flash');
-    assert.equal(fallbackNotified.toModel, 'gemini-3.8-flash-lite');
+    assert.equal(fallbackNotified.fromModel, 'gemini-3.6-flash');
+    assert.equal(fallbackNotified.toModel, 'gemini-3.7-flash');
     assert.equal(fallbackNotified.reason, 'high_demand');
   });
 
@@ -405,7 +413,7 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
       async () => {
         await generateGeminiContent({
           prompt: 'Format lecture',
-          model: 'gemini-3.8-flash'
+          model: 'gemini-3.6-flash'
         });
       },
       (err) => {
@@ -415,7 +423,7 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
     );
   });
 
-  test('Test 8: Note generation with gemini-3.8-flash succeeds', async () => {
+  test('Test 8: Note generation with gemini-3.6-flash succeeds', async () => {
     let capturedUrl = '';
     let capturedHeaders = {};
 
@@ -444,16 +452,16 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
     saveApiKey('AIzaSyValidKey', true);
     const result = await formatNotesDirect({
       text: 'Explain 3-way handshake in TCP',
-      model: 'gemini-3.8-flash'
+      model: 'gemini-3.6-flash'
     });
 
     assert.ok(result);
     assert.match(result, /TCP Handshake/);
-    assert.match(capturedUrl, /gemini-3\.8-flash:generateContent/);
+    assert.match(capturedUrl, /gemini-3\.6-flash:generateContent/);
     assert.equal(capturedHeaders['x-goog-api-key'], 'AIzaSyValidKey');
   });
 
-  test('Test 9: Chat import with gemini-3.8-flash extracts structured Q&A', async () => {
+  test('Test 9: Chat import with gemini-3.6-flash extracts structured Q&A', async () => {
     global.fetch = async (url, options) => ({
       ok: true,
       status: 200,
@@ -484,7 +492,7 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
     saveApiKey('AIzaSyValidKey', true);
     const qaItems = await extractNotesDirect({
       text: 'User: What is a distributed lock? Assistant: A mechanism to ensure mutual exclusion...',
-      model: 'gemini-3.8-flash'
+      model: 'gemini-3.6-flash'
     });
 
     assert.equal(Array.isArray(qaItems), true);

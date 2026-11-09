@@ -1,31 +1,48 @@
 /**
  * Central Gemini Model Configuration
  * Single source of truth for default model, fallback hierarchy, and model resolution.
+ *
+ * Valid model IDs as of 2026-11 (source: ai.google.dev/gemini-api/docs/deprecations):
+ *   gemini-3.7-flash, gemini-3.6-flash, gemini-3.5-flash-lite,
+ *   gemini-3.1-flash-lite, gemini-2.5-flash
+ * gemini-3.8-* does NOT exist and must not be used.
  */
 
-export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.6-flash';
 
 export const GEMINI_FALLBACK_MODELS = [
-  'gemini-3.8-flash',
-  'gemini-3.8-flash-lite',
-  'gemini-3.1-flash-lite'
+  'gemini-3.6-flash',
+  'gemini-3.7-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash'
 ];
 
 export const KNOWN_GEMINI_MODELS = [
   {
-    id: 'gemini-3.8-flash',
-    name: 'Gemini 3.8 Flash (Recommended)',
+    id: 'gemini-3.7-flash',
+    name: 'Gemini 3.7 Flash',
+    description: 'Latest, most capable flash model'
+  },
+  {
+    id: 'gemini-3.6-flash',
+    name: 'Gemini 3.6 Flash (Recommended)',
     description: 'Fast, highly capable default model for academic formatting and Q&A'
   },
   {
-    id: 'gemini-3.8-flash-lite',
-    name: 'Gemini 3.8 Flash Lite',
+    id: 'gemini-3.5-flash-lite',
+    name: 'Gemini 3.5 Flash Lite',
     description: 'Ultra-fast lightweight model, lowest latency'
   },
   {
     id: 'gemini-3.1-flash-lite',
     name: 'Gemini 3.1 Flash Lite',
     description: 'High-availability light model fallback'
+  },
+  {
+    id: 'gemini-2.5-flash',
+    name: 'Gemini 2.5 Flash',
+    description: 'Stable legacy fallback'
   }
 ];
 
@@ -49,9 +66,10 @@ export function resolvePreferredModel(savedModel, availableModels = null) {
     return modelIds[0];
   }
 
-  // If availableModels is not yet loaded, ensure saved model is not an obsolete model
+  // If availableModels is not yet loaded, ensure saved model is not an obsolete/retired model
   const obsoleteModels = [
-    'gemini-2.5-flash',
+    'gemini-3.8-flash',
+    'gemini-3.8-flash-lite',
     'gemini-2.5-flash-lite',
     'gemini-2.0-flash',
     'gemini-1.5-flash',
