@@ -44,10 +44,11 @@ export default function AiChatImportModal({
   setSaveStatus,
   getStoredApiKey,
   setShowKeyModal,
-  isDarkMode = false
+  isDarkMode = false,
+  initialUrl = ''
 }) {
   const [activeTab, setActiveTab] = useState('link'); // 'link' | 'paste' | 'upload'
-  const [shareUrl, setShareUrl] = useState('');
+  const [shareUrl, setShareUrl] = useState(() => (initialUrl ? initialUrl.trim() : ''));
   const [pastedText, setPastedText] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState('');
@@ -71,7 +72,27 @@ export default function AiChatImportModal({
   const [isEditingPasted, setIsEditingPasted] = useState(false);
   const [editableTurns, setEditableTurns] = useState([]);
 
-  if (!isOpen) return null;
+  // Filtered turns (Hooks must always run unconditionally at the top)
+  const filteredTurns = useMemo(() => {
+    if (!searchQuery.trim()) return turns;
+    const q = searchQuery.toLowerCase();
+    return turns.filter(t => (t.question || '').toLowerCase().includes(q) || (t.answer || '').toLowerCase().includes(q));
+  }, [turns, searchQuery]);
+
+  // Paginated turns
+  const paginatedTurns = useMemo(() => {
+    const start = (currentPage - 1) * itemsPerPage;
+    return filteredTurns.slice(start, start + itemsPerPage);
+  }, [filteredTurns, currentPage]);
+
+  const totalPages = Math.ceil(filteredTurns.length / itemsPerPage) || 1;
+
+  useEffect(() => {
+    if (isOpen && initialUrl && initialUrl.trim() && !shareUrl) {
+      setShareUrl(initialUrl.trim());
+      setActiveTab('link');
+    }
+  }, [isOpen, initialUrl]);
 
   const resetAll = () => {
     setShareUrl('');
@@ -387,21 +408,6 @@ export default function AiChatImportModal({
     });
   };
 
-  // Filtered turns
-  const filteredTurns = useMemo(() => {
-    if (!searchQuery.trim()) return turns;
-    const q = searchQuery.toLowerCase();
-    return turns.filter(t => t.question.toLowerCase().includes(q) || t.answer.toLowerCase().includes(q));
-  }, [turns, searchQuery]);
-
-  // Paginated turns
-  const paginatedTurns = useMemo(() => {
-    const start = (currentPage - 1) * itemsPerPage;
-    return filteredTurns.slice(start, start + itemsPerPage);
-  }, [filteredTurns, currentPage]);
-
-  const totalPages = Math.ceil(filteredTurns.length / itemsPerPage) || 1;
-
   // Final Action: Create Note from Selected
   const handleCreateNote = () => {
     const selected = turns.filter(t => selectedIndices.has(t.index));
@@ -414,6 +420,8 @@ export default function AiChatImportModal({
 
     handleClose();
   };
+
+  if (!isOpen) return null;
 
   return (
     <div className="modal-overlay" style={{ zIndex: 1100 }}>

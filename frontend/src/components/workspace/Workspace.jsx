@@ -235,8 +235,6 @@ export default function Workspace({
       }
     }).catch(() => {
       setCurrentUser(null);
-    }).finally(() => {
-      setIsAuthChecking(false);
     });
 
     // Check if user has a Gemini key saved in browser storage
@@ -1355,9 +1353,9 @@ export default function Workspace({
 
     const trimmed = importUrl.trim();
     if (
-      trimmed.includes('chatgpt.com/share') ||
-      trimmed.includes('chat.openai.com/share') ||
-      trimmed.includes('claude.ai/share')
+      trimmed.includes('chatgpt.com') ||
+      trimmed.includes('chat.openai.com') ||
+      trimmed.includes('claude.ai')
     ) {
       setShowImportModal(false);
       setShowAiChatModal(true);
@@ -4595,16 +4593,22 @@ export default function Workspace({
         </div>
       )}
 
-      <AiChatImportModal
-        isOpen={showAiChatModal}
-        onClose={() => setShowAiChatModal(false)}
-        onImportTurns={handleImportAiTurns}
-        safeApiFetch={safeApiFetch}
-        setSaveStatus={setSaveStatus}
-        getStoredApiKey={getStoredApiKey}
-        setShowKeyModal={setShowKeyModal}
-        isDarkMode={isDarkMode}
-      />
+      {showAiChatModal && (
+        <AiChatImportModal
+          isOpen={showAiChatModal}
+          initialUrl={importUrl}
+          onClose={() => {
+            setShowAiChatModal(false);
+            setImportUrl('');
+          }}
+          onImportTurns={handleImportAiTurns}
+          safeApiFetch={safeApiFetch}
+          setSaveStatus={setSaveStatus}
+          getStoredApiKey={getStoredApiKey}
+          setShowKeyModal={setShowKeyModal}
+          isDarkMode={isDarkMode}
+        />
+      )}
 
       {showExportModal && (
         <div className="modal-overlay">
