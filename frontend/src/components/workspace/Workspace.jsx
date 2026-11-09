@@ -400,6 +400,9 @@ export default function Workspace({
     if (previewRef.current) {
       await hydrateMermaidContainers(previewRef.current, isDarkMode);
     }
+    if (richEditorRef.current?.hydrateDiagrams) {
+      richEditorRef.current.hydrateDiagrams();
+    }
   }, [isHandwrittenMode, ensurePreviewLibraries, isDarkMode]);
 
   useEffect(() => {
@@ -815,24 +818,20 @@ export default function Workspace({
         apiKey: key
       });
 
-      // Requirement 7: Sanitize AI output with DOMPurify
-      const cleanHtml = DOMPurify.sanitize(rawHtml);
+      // Format diagrams & sanitize AI output with DOMPurify
+      const formattedHtml = formatAnswerWithDiagrams(rawHtml);
+      const cleanHtml = DOMPurify.sanitize(formattedHtml);
       
-      let currentIdx = 0;
-      const chunkSize = 30;
-      const stream = setInterval(() => {
-        if (currentIdx >= cleanHtml.length) {
-          clearInterval(stream);
-          setIsFormatting(false);
-          setIsDoneFormatting(true);
-          setSaveStatus('AI Improved ✓');
-          return;
-        }
-        const nextChunk = cleanHtml.substring(0, currentIdx + chunkSize);
-        setAnswerText(nextChunk);
-        if (richEditorRef.current) richEditorRef.current.setContent(nextChunk);
-        currentIdx += chunkSize;
-      }, 15);
+      setAnswerText(cleanHtml);
+      if (richEditorRef.current) {
+        richEditorRef.current.setContent(cleanHtml);
+      }
+      if (previewRef.current) {
+        await hydrateMermaidContainers(previewRef.current, isDarkMode);
+      }
+      setIsFormatting(false);
+      setIsDoneFormatting(true);
+      setSaveStatus('AI Improved ✓');
     } catch (error) {
       if (error.code === 'NO_API_KEY') {
         setShowKeyModal(true);
@@ -2388,7 +2387,8 @@ export default function Workspace({
                   model: preferredModel,
                   apiKey: key
                 });
-                setFormatOutput(DOMPurify.sanitize(rawHtml));
+                const formattedHtml = formatAnswerWithDiagrams(rawHtml);
+                setFormatOutput(DOMPurify.sanitize(formattedHtml));
               } catch (err) {
                 if (err.code === 'NO_API_KEY') {
                   setShowKeyModal(true);
@@ -4107,7 +4107,7 @@ export default function Workspace({
               <div 
                 className="user-profile-badge" 
                 onClick={() => setActiveTab('settings')}
-                title={`Logged in as ${currentUser.name} (${currentUser.plan.toUpperCase()} Plan)`}
+                title={`Logged in as ${currentUser.name} (${(currentUser.plan || 'Free').toUpperCase()} Plan)`}
               >
                 <img 
                   src={currentUser.profileImage || 'https://api.dicebear.com/7.x/bottts/svg?seed=student'} 

@@ -165,6 +165,9 @@ function parseGeminiError(status, errorObj) {
   if (status === 404 || statusText === 'NOT_FOUND' || message.includes('is not found') || message.includes('no longer available') || message.includes('not available')) {
     return 'This model is no longer available for your key. Choose another model in Settings.';
   }
+  if (status === 503 || statusText === 'UNAVAILABLE' || message.includes('high demand') || message.includes('spikes in demand')) {
+    return 'Google Gemini is currently experiencing temporary high demand (503). Automatic fallback was attempted. Please try again in a moment or choose another model in Settings.';
+  }
   if (message) {
     return `Gemini API error (${status}): ${message}`;
   }
@@ -184,6 +187,22 @@ function isModelUnavailableError(status, errorObj) {
     msg.includes('not available') ||
     msg.includes('is not found') ||
     msg.includes('was not found')
+  );
+}
+
+/**
+ * Checks whether an error indicates temporary high demand or server overload (503/502/504/500)
+ */
+function isHighDemandOrOverloadError(status, errorObj) {
+  if (status === 503 || status === 502 || status === 504 || status === 500) return true;
+  const msg = (errorObj?.error?.message || '').toLowerCase();
+  const st = (errorObj?.error?.status || '').toUpperCase();
+  return (
+    st === 'UNAVAILABLE' ||
+    msg.includes('high demand') ||
+    msg.includes('spikes in demand') ||
+    msg.includes('overloaded') ||
+    msg.includes('temporarily unavailable')
   );
 }
 
@@ -320,9 +339,10 @@ export async function callGeminiGenerateContent({
     };
   }
 
-  // Attempt generation with requested model, fallback once if 404
+  // Attempt generation with requested model, fallback once if 404 (retired) or 503 (high demand)
   let currentModel = requestedModel;
   let hasRetried = false;
+  let fallbackReason = 'retired';
 
   while (true) {
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent`;
@@ -346,16 +366,20 @@ export async function callGeminiGenerateContent({
       if (hasRetried) {
         setPreferredModel(currentModel);
         if (typeof onFallback === 'function') {
-          onFallback(currentModel, requestedModel);
+          onFallback(currentModel, requestedModel, fallbackReason);
         }
         if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+          const reasonMsg = fallbackReason === 'retired'
+            ? `Notice: Switched to ${currentModel} as ${requestedModel} is no longer available.`
+            : `Notice: Switched to ${currentModel} as ${requestedModel} is currently experiencing temporary high demand (503).`;
           window.dispatchEvent(new CustomEvent('gemini:model-fallback', {
             detail: {
               activeModel: currentModel,
               previousModel: requestedModel,
               toModel: currentModel,
               fromModel: requestedModel,
-              message: `Notice: Switched to ${currentModel} as ${requestedModel} is no longer available.`
+              reason: fallbackReason,
+              message: reasonMsg
             }
           }));
         }
@@ -366,11 +390,23 @@ export async function callGeminiGenerateContent({
 
     const errorJson = await response.json().catch(() => null);
 
-    // Check if error is 404 / model retired
+    // 1. Check if error is 404 / model retired
     if (isModelUnavailableError(response.status, errorJson) && !hasRetried) {
       const fallbackModel = getNextFallbackModel(currentModel, availableModels);
       if (fallbackModel && fallbackModel !== currentModel) {
         hasRetried = true;
+        fallbackReason = 'retired';
+        currentModel = fallbackModel;
+        continue;
+      }
+    }
+
+    // 2. Check if error is 503 / high demand / temporary overload
+    if (isHighDemandOrOverloadError(response.status, errorJson) && !hasRetried) {
+      const fallbackModel = getNextFallbackModel(currentModel, availableModels);
+      if (fallbackModel && fallbackModel !== currentModel) {
+        hasRetried = true;
+        fallbackReason = 'high_demand';
         currentModel = fallbackModel;
         continue;
       }

@@ -68,6 +68,12 @@ const {
   getNextFallbackModel
 } = await import('../frontend/src/config/geminiConfig.js');
 
+const {
+  formatAnswerWithDiagrams,
+  hasMermaidDiagram,
+  isMermaidCode
+} = await import('../frontend/src/utils/mermaidHelper.js');
+
 describe('Gemini Model Configuration & Central Architecture', () => {
   test('Central configuration defaults to gemini-3.8-flash and ordered fallbacks', () => {
     assert.equal(DEFAULT_GEMINI_MODEL, 'gemini-3.8-flash');
@@ -295,6 +301,70 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
     assert.equal(fallbackNotified.toModel, 'gemini-3.8-flash-lite');
   });
 
+  test('Test 5b: 503 High demand automatically retries once with fallback and remembers working model', async () => {
+    const attemptedModels = [];
+    let fallbackNotified = null;
+
+    window.addEventListener('gemini:model-fallback', (e) => {
+      fallbackNotified = e.detail;
+    });
+
+    global.fetch = async (url, options) => {
+      const match = url.match(/models\/([^:]+):generateContent/);
+      const model = match ? match[1] : '';
+      attemptedModels.push(model);
+
+      if (model === 'gemini-3.8-flash') {
+        return {
+          ok: false,
+          status: 503,
+          json: async () => ({
+            error: {
+              code: 503,
+              message: 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.',
+              status: 'UNAVAILABLE'
+            }
+          })
+        };
+      }
+
+      // Fallback model succeeds
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [{ text: 'Formatted notes generated via fallback model.' }]
+              }
+            }
+          ]
+        })
+      };
+    };
+
+    saveApiKey('AIzaSyWorking503FallbackKey', true);
+    setPreferredModel('gemini-3.8-flash');
+
+    const result = await generateGeminiContent({
+      prompt: 'Format this note',
+      model: 'gemini-3.8-flash'
+    });
+
+    assert.equal(result, 'Formatted notes generated via fallback model.');
+    assert.deepEqual(attemptedModels, ['gemini-3.8-flash', 'gemini-3.8-flash-lite']);
+
+    // Working model is remembered
+    assert.equal(getPreferredModel(), 'gemini-3.8-flash-lite');
+
+    // Check fallback notification
+    assert.ok(fallbackNotified);
+    assert.equal(fallbackNotified.fromModel, 'gemini-3.8-flash');
+    assert.equal(fallbackNotified.toModel, 'gemini-3.8-flash-lite');
+    assert.equal(fallbackNotified.reason, 'high_demand');
+  });
+
   test('Test 6: Retired-model 404 where all fallbacks fail shows friendly message', async () => {
     global.fetch = async () => ({
       ok: false,
@@ -421,5 +491,46 @@ describe('Gemini Key Validation & Models List Endpoint', () => {
     assert.equal(qaItems.length, 2);
     assert.equal(qaItems[0].question, 'What is a distributed lock?');
     assert.match(qaItems[0].answer, /mutual exclusion/);
+  });
+});
+
+describe('Diagram Recognition & Hydration for GPT Paste', () => {
+  test('isMermaidCode identifies various diagram types without code fences', () => {
+    assert.equal(isMermaidCode('flowchart TD\n  A --> B'), true);
+    assert.equal(isMermaidCode('graph TD\n  Start[Start] --> End[End]'), true);
+    assert.equal(isMermaidCode('sequenceDiagram\n  Alice->>Bob: Hello'), true);
+    assert.equal(isMermaidCode('classDiagram\n  class BankAccount'), true);
+    assert.equal(isMermaidCode('stateDiagram-v2\n  [*] --> Still'), true);
+    assert.equal(isMermaidCode('erDiagram\n  CUSTOMER ||--o{ ORDER : places'), true);
+    assert.equal(isMermaidCode('mindmap\n  root((mindmap))\n    Origins'), true);
+    assert.equal(isMermaidCode('Just regular text about biology'), false);
+  });
+
+  test('formatAnswerWithDiagrams converts ```mermaid blocks from GPT into hydrated containers', () => {
+    const gptText = 'Here is the architecture diagram:\n\n```mermaid\nflowchart TD\n  Client --> Server\n  Server --> Database\n```\n\nHope this helps!';
+    const formatted = formatAnswerWithDiagrams(gptText);
+    assert.match(formatted, /class="mermaid-diagram-container"/);
+    assert.match(formatted, /data-mermaid-code="flowchart%20TD/);
+  });
+
+  test('formatAnswerWithDiagrams converts raw flowchart pasted from GPT without backticks', () => {
+    const rawGptDiagram = 'flowchart TD\n  A[Input Data] --> B[Process]\n  B --> C[Output Result]';
+    const formatted = formatAnswerWithDiagrams(rawGptDiagram);
+    assert.match(formatted, /class="mermaid-diagram-container"/);
+    assert.match(formatted, /data-mermaid-code="flowchart%20TD/);
+  });
+
+  test('formatAnswerWithDiagrams converts HTML pre code blocks pasted from ChatGPT web', () => {
+    const chatGptWebHtml = '<p>Diagram below:</p><pre><code class="language-mermaid">graph TD\n  A --> B\n  B --> C</code></pre>';
+    const formatted = formatAnswerWithDiagrams(chatGptWebHtml);
+    assert.match(formatted, /class="mermaid-diagram-container"/);
+    assert.match(formatted, /data-mermaid-code="graph%20TD/);
+  });
+
+  test('formatAnswerWithDiagrams converts <div class="mermaid"> blocks produced by Gemini format', () => {
+    const geminiHtml = '<h1>Photosynthesis</h1><div class="mermaid">graph LR\n  Light --> Chlorophyll\n  Chlorophyll --> ATP</div>';
+    const formatted = formatAnswerWithDiagrams(geminiHtml);
+    assert.match(formatted, /class="mermaid-diagram-container"/);
+    assert.match(formatted, /data-mermaid-code="graph%20LR/);
   });
 });

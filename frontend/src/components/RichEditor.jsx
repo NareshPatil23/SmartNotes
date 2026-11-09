@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useImperativeHandle, forwardRef, useState, useCallback } from 'react';
 import { marked } from 'marked';
+import { hasMermaidDiagram, isMermaidCode, formatAnswerWithDiagrams, hydrateMermaidContainers } from '../utils/mermaidHelper';
 
 const COMMANDS = [
   { id: 'h1', label: 'Heading 1', icon: 'H1', category: 'Basic Blocks' },
@@ -67,15 +68,29 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
 
   const insertHTML = (html) => {
     const selection = window.getSelection();
-    if (!selection.rangeCount) return;
-    const range = selection.getRangeAt(0);
-    range.deleteContents();
     const div = document.createElement('div');
     div.innerHTML = html;
     const frag = document.createDocumentFragment();
+    let lastNode = null;
     let node;
-    while ((node = div.firstChild)) frag.appendChild(node);
-    range.insertNode(frag);
+    while ((node = div.firstChild)) {
+      lastNode = node;
+      frag.appendChild(node);
+    }
+
+    if (selection && selection.rangeCount > 0 && editorRef.current && editorRef.current.contains(selection.anchorNode)) {
+      const range = selection.getRangeAt(0);
+      range.deleteContents();
+      range.insertNode(frag);
+      if (lastNode) {
+        range.setStartAfter(lastNode);
+        range.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+    } else if (editorRef.current) {
+      editorRef.current.appendChild(frag);
+    }
     handleInput();
   };
 
@@ -177,6 +192,12 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
     if (editorRef.current && initialValue !== undefined) {
       if (editorRef.current.innerHTML !== initialValue) {
         editorRef.current.innerHTML = initialValue;
+        const isDark = document.body.classList.contains('dark-theme');
+        setTimeout(() => {
+          if (editorRef.current) {
+            hydrateMermaidContainers(editorRef.current, isDark);
+          }
+        }, 30);
       }
     }
   }, [initialValue]);
@@ -187,6 +208,18 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
     setContent: (html) => {
       editorRef.current.innerHTML = html;
       handleInput();
+      const isDark = document.body.classList.contains('dark-theme');
+      setTimeout(() => {
+        if (editorRef.current) {
+          hydrateMermaidContainers(editorRef.current, isDark);
+        }
+      }, 30);
+    },
+    hydrateDiagrams: () => {
+      if (editorRef.current) {
+        const isDark = document.body.classList.contains('dark-theme');
+        hydrateMermaidContainers(editorRef.current, isDark);
+      }
     },
     clear: () => {
       editorRef.current.innerHTML = '';
@@ -198,8 +231,25 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
     e.preventDefault();
     const html = e.clipboardData.getData('text/html');
     const text = e.clipboardData.getData('text/plain');
+    const isDark = document.body.classList.contains('dark-theme');
 
-    const isMarkdown = text && (text.includes('**') || text.includes('###') || /^\d+\.\s/m.test(text) || /^-\s/m.test(text) || text.includes('\\[') || text.includes('$$') || text.includes('\\(') || text.includes('\\text{'));
+    const containsDiagram = isMermaidCode(text) || hasMermaidDiagram(text) || (html && (html.includes('language-mermaid') || html.includes('mermaid-diagram-container') || html.includes('class="mermaid"')));
+    const isMarkdown = containsDiagram || (text && (text.includes('**') || text.includes('###') || text.includes('```') || /^\d+\.\s/m.test(text) || /^-\s/m.test(text) || text.includes('\\[') || text.includes('$$') || text.includes('\\(') || text.includes('\\text{')));
+
+    if (containsDiagram) {
+      let diagramText = text || '';
+      if (!diagramText.includes('```') && isMermaidCode(diagramText.trim())) {
+        diagramText = `\`\`\`mermaid\n${diagramText.trim()}\n\`\`\``;
+      }
+      const formattedHtml = formatAnswerWithDiagrams(diagramText);
+      insertHTML(formattedHtml);
+      setTimeout(() => {
+        if (editorRef.current) {
+          hydrateMermaidContainers(editorRef.current, isDark);
+        }
+      }, 50);
+      return;
+    }
 
     if (isMarkdown || !html) {
       let processedText = text || '';
@@ -224,6 +274,11 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
       });
 
       insertHTML(parsedHtml);
+      setTimeout(() => {
+        if (editorRef.current) {
+          hydrateMermaidContainers(editorRef.current, isDark);
+        }
+      }, 50);
     } else if (html) {
       const tempDiv = document.createElement('div');
       tempDiv.innerHTML = html;
@@ -248,6 +303,11 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
       }
 
       insertHTML(tempDiv.innerHTML);
+      setTimeout(() => {
+        if (editorRef.current) {
+          hydrateMermaidContainers(editorRef.current, isDark);
+        }
+      }, 50);
     }
   };
 
