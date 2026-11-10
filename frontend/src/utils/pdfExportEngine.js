@@ -49,69 +49,165 @@ function arrayBufferToBase64(buffer) {
 }
 
 /**
- * Helper to convert an SVG element to high-res PNG Data URL
+ * Helper to convert an SVG element to high-res PNG Data URL at 2x scale
+ * Ensures explicit xmlns, width, and height so Image() renders reliably on canvas.
  */
-async function svgToPngDataUrl(svgElement, scale = 3) {
+async function svgElementToPngDataUrl(svgElement, scale = 2) {
+  if (!svgElement) return null;
   return new Promise((resolve) => {
     try {
-      const svgClone = svgElement.cloneNode(true);
-      const bbox = svgElement.getBoundingClientRect();
+      const bbox = svgElement.getBoundingClientRect ? svgElement.getBoundingClientRect() : { width: 0, height: 0 };
       let width = bbox.width > 0 ? bbox.width : 0;
       let height = bbox.height > 0 ? bbox.height : 0;
+
       if (!width || !height) {
-        if (svgElement.viewBox && svgElement.viewBox.baseVal && svgElement.viewBox.baseVal.width > 0) {
-          width = svgElement.viewBox.baseVal.width;
-          height = svgElement.viewBox.baseVal.height;
+        const vb = svgElement.viewBox?.baseVal;
+        if (vb && vb.width > 0 && vb.height > 0) {
+          width = vb.width;
+          height = vb.height;
         } else {
-          width = parseFloat(svgElement.getAttribute('width')) || 600;
-          height = parseFloat(svgElement.getAttribute('height')) || 400;
+          const vbAttr = svgElement.getAttribute('viewBox');
+          if (vbAttr) {
+            const parts = vbAttr.trim().split(/[\s,]+/).map(Number);
+            if (parts.length === 4 && parts[2] > 0 && parts[3] > 0) {
+              width = parts[2];
+              height = parts[3];
+            }
+          }
         }
       }
-      svgClone.setAttribute('width', width);
-      svgClone.setAttribute('height', height);
+
+      if (!width || !height) {
+        const wAttr = parseFloat(svgElement.getAttribute('width'));
+        const hAttr = parseFloat(svgElement.getAttribute('height'));
+        if (wAttr > 0 && hAttr > 0) {
+          width = wAttr;
+          height = hAttr;
+        }
+      }
+
+      if (!width || width <= 0) width = 600;
+      if (!height || height <= 0) height = 400;
+
+      const svgClone = svgElement.cloneNode(true);
+      svgClone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+      svgClone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
+      svgClone.setAttribute('width', String(width));
+      svgClone.setAttribute('height', String(height));
 
       const xml = new XMLSerializer().serializeToString(svgClone);
-      const svgBlob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' });
-      const URL = window.URL || window.webkitURL || window;
-      const blobURL = URL.createObjectURL(svgBlob);
+      const svgDataUrl = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(xml);
 
       const img = new Image();
       img.onload = () => {
-        const canvas = document.createElement('canvas');
-        canvas.width = Math.max(10, width * scale);
-        canvas.height = Math.max(10, height * scale);
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.fillStyle = '#ffffff';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          const dataUrl = canvas.toDataURL('image/png');
-          URL.revokeObjectURL(blobURL);
-          resolve({ dataUrl, width, height });
-          return;
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(10, Math.round(width * scale));
+          canvas.height = Math.max(10, Math.round(height * scale));
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            const dataUrl = canvas.toDataURL('image/png');
+            resolve({ dataUrl, width, height });
+            return;
+          }
+          resolve(null);
+        } catch (canvasErr) {
+          console.warn('Canvas rasterization error:', canvasErr);
+          resolve(null);
         }
-        URL.revokeObjectURL(blobURL);
+      };
+      img.onerror = (err) => {
+        console.warn('SVG image load error in PDF export:', err);
         resolve(null);
       };
-      img.onerror = () => {
-        URL.revokeObjectURL(blobURL);
-        resolve(null);
-      };
-      img.src = blobURL;
-    } catch (_) {
+      img.src = svgDataUrl;
+    } catch (e) {
+      console.warn('SVG to PNG conversion exception:', e);
       resolve(null);
     }
   });
 }
 
 /**
+ * Pre-processes all Mermaid diagrams in the cloned export DOM before PDF generation:
+ * - Awaits document.fonts.ready to ensure diagram fonts (e.g. Inter) are loaded before canvas draw
+ * - Hydrates any unhydrated diagram containers in the cloned DOM
+ * - Converts each SVG to a 2x scale PNG data URL
+ * - Replaces the SVG with an <img> (max-width: 100%, height: auto)
+ * - Removes injected <style> text nodes left by Mermaid in the export DOM
+ * - Awaits Promise.all on all image replacements before PDF rendering begins
+ */
+async function prepareExportMermaidDiagrams(exportDom) {
+  if (!exportDom) return;
+
+  // 1. Ensure fonts are ready before canvas draw
+  if (typeof document !== 'undefined' && document.fonts && document.fonts.ready) {
+    try {
+      await document.fonts.ready;
+    } catch (_) {}
+  }
+
+  // 2. Hydrate any unhydrated diagram containers in the export DOM
+  try {
+    await hydrateMermaidContainers(exportDom, false);
+  } catch (err) {
+    console.warn('Hydrating mermaid diagrams in export DOM warning:', err);
+  }
+
+  // 3. Find all SVG elements within Mermaid containers or direct SVGs
+  const diagramContainers = Array.from(exportDom.querySelectorAll('.mermaid-diagram-container, .mermaid'));
+  const conversionPromises = diagramContainers.map(async (container) => {
+    // Skip if error banner is present
+    if (container.classList.contains('mermaid-error-banner') || container.querySelector('.mermaid-error-banner')) {
+      return;
+    }
+
+    const svg = container.querySelector('svg');
+    if (!svg) return;
+
+    try {
+      const pngResult = await svgElementToPngDataUrl(svg, 2.0);
+      if (pngResult && pngResult.dataUrl) {
+        const img = document.createElement('img');
+        img.src = pngResult.dataUrl;
+        img.className = 'mermaid-rendered-img';
+        img.style.maxWidth = '100%';
+        img.style.height = 'auto';
+        img.style.display = 'block';
+        img.style.margin = '0 auto';
+        img.setAttribute('data-original-width', String(pngResult.width));
+        img.setAttribute('data-original-height', String(pngResult.height));
+
+        // Clean out internal SVG and <style> tags completely to avoid text leaks
+        container.innerHTML = '';
+        container.appendChild(img);
+        container.classList.add('mermaid-img-ready');
+        container.style.pageBreakInside = 'avoid';
+        container.style.breakInside = 'avoid';
+      }
+    } catch (err) {
+      console.warn('Diagram SVG to PNG conversion failed:', err);
+    }
+  });
+
+  await Promise.all(conversionPromises);
+
+  // 4. Remove any injected <style> text nodes left by Mermaid in the export DOM
+  exportDom.querySelectorAll('style[id*="mermaid"], style.mermaid-style').forEach(st => st.remove());
+}
+
+/**
  * Helper to convert an HTML formula or diagram container to high-res image
  */
 async function domElementToPngDataUrl(el, scale = 2) {
+  if (!el) return null;
   // If element contains an SVG, use direct SVG rendering
   const svg = el.querySelector('svg');
   if (svg) {
-    return await svgToPngDataUrl(svg, scale);
+    return await svgElementToPngDataUrl(svg, scale);
   }
 
   // Otherwise draw styled text representation or canvas
@@ -388,10 +484,11 @@ export async function generateClientPDF(options = {}) {
       tempDiv.innerHTML = q.answer;
       document.body.appendChild(tempDiv);
 
+      // Pre-process all Mermaid diagrams in cloned DOM: rasterize to 2x PNG img, remove style leaks
       try {
-        await hydrateMermaidContainers(tempDiv, false);
+        await prepareExportMermaidDiagrams(tempDiv);
       } catch (err) {
-        console.warn('Hydrating mermaid diagrams in PDF export warning:', err);
+        console.warn('Pre-rendering mermaid diagrams in PDF export warning:', err);
       }
 
       // Hydrate KaTeX math formulas in export container
@@ -773,7 +870,25 @@ async function renderNodeBlock(doc, node, ctx) {
     const level = parseInt(tagName.charAt(1), 10);
     const headingSizes = { 1: 18, 2: 15, 3: 13, 4: 12, 5: 11, 6: 10 };
     const hSize = headingSizes[level] || 14;
-    const breakThreshold = (level <= 2) ? 22 : 16;
+    let breakThreshold = (level <= 2) ? 22 : 16;
+
+    // Keep heading with its diagram so heading is never left alone at bottom of page
+    const nextEl = node.nextElementSibling;
+    if (nextEl && (
+      nextEl.classList?.contains('mermaid-diagram-container') ||
+      nextEl.classList?.contains('mermaid') ||
+      nextEl.querySelector?.('.mermaid, svg, img.mermaid-rendered-img')
+    )) {
+      const diagImg = nextEl.querySelector('img.mermaid-rendered-img, img');
+      let diagHeight = 60; // sensible estimated diagram height in mm
+      if (diagImg) {
+        const oW = parseFloat(diagImg.getAttribute('data-original-width')) || 600;
+        const oH = parseFloat(diagImg.getAttribute('data-original-height')) || 400;
+        const dispW = Math.min(contentWidth, 160);
+        diagHeight = Math.min((oH / oW) * dispW, pageHeight - marginConfig.top - marginConfig.bottom - 25);
+      }
+      breakThreshold = Math.max(breakThreshold, (hSize * 0.45) + diagHeight + 10);
+    }
 
     if (getY() + breakThreshold > pageHeight - marginConfig.bottom) addNewPage();
 
@@ -792,21 +907,38 @@ async function renderNodeBlock(doc, node, ctx) {
 
   // 2. Diagrams (Mermaid SVG & containers)
   if (
-    (className.includes('mermaid') || tagName === 'SVG' || className.includes('mermaid-diagram-container') || node.querySelector('.mermaid, svg, .mermaid-diagram-container')) &&
+    (className.includes('mermaid') || tagName === 'SVG' || className.includes('mermaid-diagram-container') || node.querySelector('.mermaid, svg, .mermaid-diagram-container, img.mermaid-rendered-img')) &&
     !className.includes('mermaid-error-banner') &&
     !node.querySelector('.mermaid-error-banner')
   ) {
-    const targetElement = tagName === 'SVG' ? node : (node.querySelector('svg') || node);
-    const rendered = await domElementToPngDataUrl(targetElement, 3.0);
-    if (rendered && rendered.dataUrl) {
+    let dataUrl = null;
+    let width = 0;
+    let height = 0;
+
+    const imgEl = node.tagName === 'IMG' ? node : node.querySelector('img.mermaid-rendered-img, img');
+    if (imgEl && imgEl.src && imgEl.src.startsWith('data:image/')) {
+      dataUrl = imgEl.src;
+      width = parseFloat(imgEl.getAttribute('data-original-width')) || imgEl.naturalWidth || 600;
+      height = parseFloat(imgEl.getAttribute('data-original-height')) || imgEl.naturalHeight || 400;
+    } else {
+      const targetElement = tagName === 'SVG' ? node : (node.querySelector('svg') || node);
+      const rendered = await svgElementToPngDataUrl(targetElement, 2.0);
+      if (rendered && rendered.dataUrl) {
+        dataUrl = rendered.dataUrl;
+        width = rendered.width;
+        height = rendered.height;
+      }
+    }
+
+    if (dataUrl && width > 0 && height > 0) {
       const maxPdfHeight = pageHeight - marginConfig.top - marginConfig.bottom - 15;
       let imgWidth = Math.min(contentWidth, 160);
-      let imgHeight = (rendered.height / rendered.width) * imgWidth;
+      let imgHeight = (height / width) * imgWidth;
 
       // Prevent cut-off: if diagram height exceeds full page printable area, scale proportionally
       if (imgHeight > maxPdfHeight) {
         imgHeight = maxPdfHeight;
-        imgWidth = (rendered.width / rendered.height) * imgHeight;
+        imgWidth = (width / height) * imgHeight;
       }
 
       // Check if page break needed
@@ -815,10 +947,13 @@ async function renderNodeBlock(doc, node, ctx) {
       }
 
       const posX = (pageWidth - imgWidth) / 2;
-      doc.addImage(rendered.dataUrl, 'PNG', posX, getY(), imgWidth, imgHeight);
+      doc.addImage(dataUrl, 'PNG', posX, getY(), imgWidth, imgHeight);
       setY(getY() + imgHeight + 6);
       return;
     }
+
+    // Never fall through to print raw CSS or style text
+    return;
   }
 
   // 3. Mathematical Formulas (KaTeX display or formula block)

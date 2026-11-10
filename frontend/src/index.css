@@ -573,11 +573,21 @@ body {
   display: block;
   margin: 0 auto;
 }
-.mermaid-svg-wrapper {
+.mermaid-svg-wrapper,
+.mermaid-rendered-img {
   width: 100%;
   display: flex;
   justify-content: center;
   overflow-x: auto;
+  page-break-inside: avoid !important;
+  break-inside: avoid !important;
+}
+
+.mermaid-rendered-img {
+  max-width: 100% !important;
+  height: auto !important;
+  display: block;
+  margin: 0 auto;
 }
 
 .handwritten-mode-active .mermaid,

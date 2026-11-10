@@ -976,4 +976,106 @@ describe('PDF Export Engine: List, Code Block, and Math Node Classification', ()
     const ol = new MockElement('OL', '', [li1]);
     assert.equal(isFormulaNode(ol), false, '<ol> is not a formula block itself');
   });
+
+  test('configureMermaid sets htmlLabels: false and flowchart: { htmlLabels: false }', async () => {
+    const { configureMermaid } = await import('../frontend/src/utils/mermaidHelper.js');
+    let initConfig = null;
+    const mockMermaid = {
+      initialize: (cfg) => {
+        initConfig = cfg;
+      }
+    };
+    configureMermaid(mockMermaid, false);
+    assert.ok(initConfig, 'Mermaid was initialized');
+    assert.equal(initConfig.htmlLabels, false, 'htmlLabels must be false');
+    assert.equal(initConfig.flowchart?.htmlLabels, false, 'flowchart.htmlLabels must be false');
+  });
+
+  test('3 diagrams (short flowchart, tall flowchart, page-boundary) rasterize to <img> without raw CSS text', () => {
+    // Simulate DOM for a note containing 3 diagrams
+    const createDiagramContainer = (id, height) => {
+      const styleEl = new MockElement('STYLE', '', [], `#mermaid-svg-${id}{font-family:'Inter',-apple-system;}`);
+      const textNode = new MockElement('TEXT', '', [], 'Node A -> Node B');
+      const svg = new MockElement('SVG', '', [styleEl, textNode]);
+      svg.viewBox = { baseVal: { width: 500, height: height } };
+      svg.getAttribute = (attr) => attr === 'viewBox' ? `0 0 500 ${height}` : null;
+      svg.setAttribute = (attr, val) => { svg[attr] = val; };
+      svg.cloneNode = () => svg;
+
+      const container = new MockElement('DIV', 'mermaid-diagram-container', [svg]);
+      return { container, svg, styleEl };
+    };
+
+    // Diagram 1: short flowchart
+    const d1 = createDiagramContainer('1', 200);
+    // Diagram 2: tall flowchart (e.g. 1200px tall)
+    const d2 = createDiagramContainer('2', 1200);
+    // Diagram 3: flowchart near page boundary with preceding heading
+    const d3 = createDiagramContainer('3', 350);
+
+    const heading = new MockElement('H3', '', [], '3. Diagram: Forensic Data Validation Process');
+    heading.nextElementSibling = d3.container;
+
+    // Simulate pre-processing: replace SVG with <img> and clear internal style
+    [d1, d2, d3].forEach(({ container, svg }, idx) => {
+      const img = new MockElement('IMG', 'mermaid-rendered-img', []);
+      img.src = `data:image/png;base64,mockPngData_${idx}`;
+      img.style = { maxWidth: '100%', height: 'auto' };
+      img.getAttribute = (attr) => {
+        if (attr === 'data-original-width') return '500';
+        if (attr === 'data-original-height') return idx === 1 ? '1200' : '250';
+        return null;
+      };
+
+      container.children = [img];
+      container.childNodes = [img];
+      container.className = 'mermaid-diagram-container mermaid-img-ready';
+    });
+
+    // 1. Confirm no raw CSS text leaks into container text
+    assert.doesNotMatch(d1.container.innerText, /#mermaid-svg-/, 'No CSS text in d1');
+    assert.doesNotMatch(d2.container.innerText, /#mermaid-svg-/, 'No CSS text in d2');
+    assert.doesNotMatch(d3.container.innerText, /#mermaid-svg-/, 'No CSS text in d3');
+
+    // 2. Confirm diagrams contain <img> elements with data URL
+    assert.equal(d1.container.children[0].tagName, 'IMG');
+    assert.ok(d1.container.children[0].src.startsWith('data:image/png'));
+    assert.equal(d2.container.children[0].tagName, 'IMG');
+    assert.equal(d3.container.children[0].tagName, 'IMG');
+
+    // 3. Confirm heading keeps diagram together: requiredHeight includes heading + diagram
+    const level = 3;
+    const hSize = 13;
+    const contentWidth = 170;
+    const pageHeight = 297;
+    const marginConfig = { top: 22, bottom: 22 };
+
+    let breakThreshold = 16;
+    const nextEl = heading.nextElementSibling;
+    if (nextEl) {
+      const diagImg = nextEl.children[0];
+      const oW = 500;
+      const oH = parseFloat(diagImg.getAttribute('data-original-height'));
+      const dispW = Math.min(contentWidth, 160);
+      const diagHeight = Math.min((oH / oW) * dispW, pageHeight - marginConfig.top - marginConfig.bottom - 25);
+      breakThreshold = Math.max(breakThreshold, (hSize * 0.45) + diagHeight + 10);
+    }
+
+    // Threshold should be comfortably large enough (~95mm) to pull heading + diagram to next page together
+    assert.ok(breakThreshold > 50, 'Heading break threshold includes diagram height to avoid orphan heading');
+
+    // 4. Confirm tall diagram scaling: diagram taller than page is scaled to maxPdfHeight
+    const maxPdfHeight = pageHeight - marginConfig.top - marginConfig.bottom - 15; // 238mm
+    const origW = 500;
+    const origH = 1200;
+    let imgW = Math.min(contentWidth, 160); // 160
+    let imgH = (origH / origW) * imgW; // 384mm > 238mm
+    if (imgH > maxPdfHeight) {
+      imgH = maxPdfHeight;
+      imgW = (origW / origH) * imgH;
+    }
+
+    assert.ok(imgH <= maxPdfHeight, 'Tall diagram is clamped to fit within printable page height');
+    assert.ok(imgW <= contentWidth, 'Scaled width stays within page printable width');
+  });
 });

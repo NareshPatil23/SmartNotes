@@ -107,6 +107,8 @@ export function configureMermaid(mermaid, isDark = false) {
     suppressErrors: true,
     htmlLabels: false, // Emits pure SVG <text> elements; survives DOMPurify & renders on canvas/PDF
     flowchart: { htmlLabels: false, curve: 'basis' },
+    state: { htmlLabels: false },
+    class: { htmlLabels: false },
     sequence: { showSequenceNumbers: false, actorMargin: 50 },
     er: { useMaxWidth: true }
   });
