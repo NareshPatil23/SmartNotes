@@ -857,3 +857,123 @@ describe('Format All: Block Detection, Concurrency, and 429 Exponential Backoff'
     assert.equal(toastMsg, '8 formatted, 1 skipped (already formatted), 1 skipped (empty), 1 failed');
   });
 });
+
+describe('PDF Export Engine: List, Code Block, and Math Node Classification', () => {
+  // Simple DOM Node simulator for test environment
+  class MockElement {
+    constructor(tagName, className = '', children = [], text = '') {
+      this.nodeType = 1;
+      this.tagName = tagName.toUpperCase();
+      this.className = className;
+      this.classList = {
+        contains: (cls) => this.className.split(/\s+/).includes(cls)
+      };
+      this.children = children;
+      this.childNodes = [...children];
+      this.parentElement = null;
+      this._text = text;
+
+      children.forEach(c => {
+        c.parentElement = this;
+      });
+    }
+
+    get innerText() {
+      if (this._text) return this._text;
+      return this.children.map(c => c.innerText || c.textContent || '').join('\n');
+    }
+
+    get textContent() {
+      return this.innerText;
+    }
+
+    querySelector(selector) {
+      if (selector === 'code') {
+        return this.children.find(c => c.tagName === 'CODE') ||
+          this.children.reduce((acc, c) => acc || c.querySelector?.('code'), null);
+      }
+      if (selector === '.katex-display') {
+        return this.children.find(c => c.className?.includes('katex-display')) ||
+          this.children.reduce((acc, c) => acc || c.querySelector?.('.katex-display'), null);
+      }
+      return null;
+    }
+
+    getAttribute(attr) {
+      return this[attr] || null;
+    }
+  }
+
+  // Pure implementations matching pdfExportEngine.js
+  function isFormulaNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    const tagName = node.tagName ? node.tagName.toUpperCase() : '';
+    const className = typeof node.className === 'string' ? node.className : '';
+
+    if (className.includes('katex-display') || className.includes('formula-block')) return true;
+    if (node.classList && (node.classList.contains('katex-display') || node.classList.contains('formula-block'))) return true;
+    if ((tagName === 'P' || tagName === 'DIV') && node.children.length === 1) {
+      const firstChild = node.children[0];
+      const cName = typeof firstChild.className === 'string' ? firstChild.className : '';
+      if (cName.includes('katex-display') || cName.includes('formula-block') || cName.includes('katex')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function isCodeBlockNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    const tagName = node.tagName ? node.tagName.toUpperCase() : '';
+    const className = typeof node.className === 'string' ? node.className : '';
+
+    if (tagName === 'PRE') return true;
+    if (className.includes('ascii-block') || className.includes('code-block')) return true;
+    if (tagName === 'CODE' && (!node.parentElement || !['P', 'LI', 'SPAN', 'TD', 'TH', 'BLOCKQUOTE'].includes(node.parentElement.tagName))) {
+      return true;
+    }
+    if (tagName === 'DIV' && node.children.length === 1 && node.children[0].tagName === 'PRE') {
+      return true;
+    }
+    return false;
+  }
+
+  test('An <ol> containing inline <code> in an item must NOT be classified as a code block', () => {
+    const inlineCode1 = new MockElement('CODE', '', [], 'Win.exe');
+    const inlineCode2 = new MockElement('CODE', '', [], 'DLLs');
+    const li5 = new MockElement('LI', '', [inlineCode1, inlineCode2], 'Compare Files with Original Installation Image: Verify hash values for critical binaries (e.g., Win.exe, DLLs)');
+    const ol = new MockElement('OL', '', [li5]);
+
+    // Crucial check: old buggy engine did `node.querySelector("code")` on <ol> which returned true!
+    assert.equal(isCodeBlockNode(ol), false, '<ol> with child inline code must NOT be treated as a code block');
+    assert.equal(ol.tagName, 'OL', 'Tag name remains OL for list handling');
+  });
+
+  test('A <p> containing inline <code> must NOT be classified as a code block', () => {
+    const inlineCode = new MockElement('CODE', '', [], 'npm test');
+    const p = new MockElement('P', '', [inlineCode], 'To verify your changes, run npm test in the terminal.');
+
+    assert.equal(isCodeBlockNode(p), false, '<p> with inline <code> must NOT be treated as a code block');
+  });
+
+  test('A standalone <pre><code> block IS correctly classified as a code block', () => {
+    const code = new MockElement('CODE', 'language-javascript', [], 'function solve() { return 42; }');
+    const pre = new MockElement('PRE', '', [code]);
+
+    assert.equal(isCodeBlockNode(pre), true, '<pre> must be classified as a code block');
+  });
+
+  test('Formula blocks (.katex-display) are correctly identified without misclassifying parent lists', () => {
+    const formulaSpan = new MockElement('SPAN', 'katex-display', [], 'H(x) = SHA-1(x)');
+    const formulaP = new MockElement('P', '', [formulaSpan]);
+    const normalP = new MockElement('P', '', [], 'Establishing standard procedures is critical for investigators.');
+
+    assert.equal(isFormulaNode(formulaSpan), true, 'Direct .katex-display element is a formula block');
+    assert.equal(isFormulaNode(formulaP), true, '<p> wrapping a .katex-display is a formula block');
+    assert.equal(isFormulaNode(normalP), false, 'Normal text paragraph is not a formula block');
+
+    const li1 = new MockElement('LI', '', [formulaP]);
+    const ol = new MockElement('OL', '', [li1]);
+    assert.equal(isFormulaNode(ol), false, '<ol> is not a formula block itself');
+  });
+});

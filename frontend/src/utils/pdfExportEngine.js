@@ -394,9 +394,31 @@ export async function generateClientPDF(options = {}) {
         console.warn('Hydrating mermaid diagrams in PDF export warning:', err);
       }
 
+      // Hydrate KaTeX math formulas in export container
+      try {
+        if (!window.renderMathInElement) {
+          const autoRender = await import('katex/dist/contrib/auto-render.mjs');
+          await import('katex/dist/katex.min.css');
+          window.renderMathInElement = autoRender.default || autoRender;
+        }
+        if (window.renderMathInElement) {
+          window.renderMathInElement(tempDiv, {
+            delimiters: [
+              { left: '$$', right: '$$', display: true },
+              { left: '$', right: '$', display: false },
+              { left: '\\(', right: '\\)', display: false },
+              { left: '\\[', right: '\\]', display: true }
+            ],
+            throwOnError: false
+          });
+        }
+      } catch (err) {
+        console.warn('Hydrating math formulas in PDF export warning:', err);
+      }
+
       // Render each child block sequentially
-      const nodes = Array.from(tempDiv.children);
-      if (nodes.length === 0) {
+      const childNodes = Array.from(tempDiv.childNodes);
+      if (childNodes.length === 0) {
         // Plain text fallback
         renderTextParagraph(doc, tempDiv.innerText || tempDiv.textContent, {
           chosenFontKey,
@@ -413,27 +435,51 @@ export async function generateClientPDF(options = {}) {
           addNewPage
         });
       } else {
-        for (const node of nodes) {
+        for (const child of childNodes) {
           if (signal?.aborted) {
             tempDiv.remove();
             throw new Error('AbortError');
           }
-          await renderNodeBlock(doc, node, {
-            chosenFontKey,
-            baseFontSize,
-            primaryInkColor,
-            secondaryColor,
-            marginConfig,
-            pageWidth,
-            pageHeight,
-            contentWidth,
-            lineSpacingMultiplier,
-            isCursiveMode,
-            exportTheme,
-            getY: () => currentY,
-            setY: (y) => { currentY = y; },
-            addNewPage
-          });
+          if (child.nodeType === 3) {
+            // Text node
+            const txt = (child.textContent || '').trim();
+            if (txt) {
+              renderTextParagraph(doc, txt, {
+                chosenFontKey,
+                baseFontSize,
+                primaryInkColor,
+                secondaryColor,
+                marginConfig,
+                pageWidth,
+                pageHeight,
+                contentWidth,
+                lineSpacingMultiplier,
+                isCursiveMode,
+                exportTheme,
+                getY: () => currentY,
+                setY: (y) => { currentY = y; },
+                addNewPage
+              });
+            }
+          } else if (child.nodeType === 1) {
+            // Element node
+            await renderNodeBlock(doc, child, {
+              chosenFontKey,
+              baseFontSize,
+              primaryInkColor,
+              secondaryColor,
+              marginConfig,
+              pageWidth,
+              pageHeight,
+              contentWidth,
+              lineSpacingMultiplier,
+              isCursiveMode,
+              exportTheme,
+              getY: () => currentY,
+              setY: (y) => { currentY = y; },
+              addNewPage
+            });
+          }
         }
       }
       tempDiv.remove();
@@ -559,20 +605,177 @@ function renderTextParagraph(doc, rawText, ctx) {
 }
 
 /**
+ * Detects whether a DOM node is a dedicated formula block (e.g. .katex-display)
+ */
+function isFormulaNode(node) {
+  if (!node || node.nodeType !== 1) return false;
+  const tagName = node.tagName ? node.tagName.toUpperCase() : '';
+  const className = typeof node.className === 'string' ? node.className : '';
+
+  if (className.includes('katex-display') || className.includes('formula-block')) return true;
+  if (node.classList && (node.classList.contains('katex-display') || node.classList.contains('formula-block'))) return true;
+  if ((tagName === 'P' || tagName === 'DIV') && node.children.length === 1) {
+    const firstChild = node.children[0];
+    const cName = typeof firstChild.className === 'string' ? firstChild.className : '';
+    if (cName.includes('katex-display') || cName.includes('formula-block') || cName.includes('katex')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Detects whether a DOM node is an actual code block or ASCII diagram,
+ * and NOT a paragraph or list item that happens to contain inline <code>.
+ */
+function isCodeBlockNode(node) {
+  if (!node || node.nodeType !== 1) return false;
+  const tagName = node.tagName ? node.tagName.toUpperCase() : '';
+  const className = typeof node.className === 'string' ? node.className : '';
+
+  if (tagName === 'PRE') return true;
+  if (className.includes('ascii-block') || className.includes('code-block')) return true;
+  if (tagName === 'CODE' && (!node.parentElement || !['P', 'LI', 'SPAN', 'TD', 'TH', 'BLOCKQUOTE'].includes(node.parentElement.tagName))) {
+    return true;
+  }
+  if (tagName === 'DIV' && node.children.length === 1 && node.children[0].tagName === 'PRE') {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Renders a mathematical formula block into jsPDF with centered callout box and clean typography
+ */
+async function renderFormulaBlock(doc, node, ctx) {
+  const { chosenFontKey, baseFontSize, primaryInkColor, marginConfig, pageWidth, pageHeight, contentWidth, isCursiveMode, getY, setY, addNewPage } = ctx;
+
+  let formulaText = '';
+  const katexHtml = node.querySelector('.katex-html');
+  const annotation = node.querySelector('annotation');
+
+  if (katexHtml && (katexHtml.innerText || katexHtml.textContent)) {
+    formulaText = (katexHtml.innerText || katexHtml.textContent).trim();
+  } else if (annotation && annotation.textContent) {
+    formulaText = annotation.textContent.trim();
+  } else {
+    formulaText = (node.innerText || node.textContent || '').trim();
+  }
+
+  // Clean formula display string
+  formulaText = formulaText
+    .replace(/\\text\{([^}]+)\}/g, '$1')
+    .replace(/\\mathrm\{([^}]+)\}/g, '$1')
+    .replace(/\\mathbf\{([^}]+)\}/g, '$1')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  // If node contains an SVG (e.g. square roots, arrows, complex symbols)
+  if (node.querySelector('svg')) {
+    const rendered = await domElementToPngDataUrl(node, 2.5);
+    if (rendered && rendered.dataUrl) {
+      const imgWidth = Math.min(contentWidth * 0.85, (rendered.width / 2.5) * 0.264);
+      const imgHeight = (rendered.height / rendered.width) * imgWidth;
+      const boxHeight = imgHeight + 8;
+
+      if (getY() + boxHeight > pageHeight - marginConfig.bottom) addNewPage();
+
+      const boxWidth = Math.min(contentWidth, Math.max(imgWidth + 16, 85));
+      const boxX = marginConfig.left + (contentWidth - boxWidth) / 2;
+
+      // Draw subtle formula callout box
+      doc.setFillColor(248, 250, 252);
+      doc.setDrawColor(226, 232, 240);
+      doc.setLineWidth(0.3);
+      doc.roundedRect(boxX, getY(), boxWidth, boxHeight, 2.5, 2.5, 'FD');
+
+      const imgX = boxX + (boxWidth - imgWidth) / 2;
+      doc.addImage(rendered.dataUrl, 'PNG', imgX, getY() + 4, imgWidth, imgHeight);
+      setY(getY() + boxHeight + 4);
+      return;
+    }
+  }
+
+  // Vector formula callout box
+  doc.setFont(chosenFontKey, 'normal');
+  doc.setFontSize(isCursiveMode ? baseFontSize + 2 : baseFontSize + 1.5);
+
+  const textWidth = doc.getTextWidth(formulaText);
+  const boxWidth = Math.min(contentWidth, Math.max(textWidth + 24, 75));
+  const boxHeight = 14;
+
+  if (getY() + boxHeight + 4 > pageHeight - marginConfig.bottom) addNewPage();
+
+  const boxX = marginConfig.left + (contentWidth - boxWidth) / 2;
+
+  // Background and border matching preview
+  doc.setFillColor(248, 250, 252);
+  doc.setDrawColor(226, 232, 240);
+  doc.setLineWidth(0.3);
+  doc.roundedRect(boxX, getY(), boxWidth, boxHeight, 2.5, 2.5, 'FD');
+
+  // Centered formula text
+  doc.setTextColor(30, 41, 59); // #1e293b dark slate
+  doc.text(formulaText, boxX + boxWidth / 2, getY() + (boxHeight / 2) + 1.5, { align: 'center' });
+
+  setY(getY() + boxHeight + 4);
+  doc.setFontSize(baseFontSize);
+  doc.setTextColor(primaryInkColor[0], primaryInkColor[1], primaryInkColor[2]);
+}
+
+/**
+ * Renders a list item paragraph with hanging indent and proper prefix
+ */
+function renderListItemText(doc, prefix, rawText, ctx) {
+  if (!rawText || !rawText.trim()) return;
+  const { chosenFontKey, baseFontSize, primaryInkColor, marginConfig, pageHeight, contentWidth, lineSpacingMultiplier, isCursiveMode, getY, setY, addNewPage } = ctx;
+
+  doc.setFont(chosenFontKey, 'normal');
+  doc.setFontSize(baseFontSize);
+  doc.setTextColor(primaryInkColor[0], primaryInkColor[1], primaryInkColor[2]);
+
+  const step = isCursiveMode ? 9 : (baseFontSize * 0.3528 * lineSpacingMultiplier);
+  const itemIndent = isCursiveMode ? 4 : 3;
+  const prefixWidth = Math.max(doc.getTextWidth(prefix) + 1.5, 6);
+  const textWidth = contentWidth - itemIndent - prefixWidth;
+
+  // Strip leading prefix if it was already included in rawText to avoid "1. 1. "
+  let cleanText = rawText.trim();
+  const escapedPrefix = prefix.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  cleanText = cleanText.replace(new RegExp('^' + escapedPrefix + '\\s*'), '');
+
+  const lines = doc.splitTextToSize(cleanText, textWidth);
+
+  for (let i = 0; i < lines.length; i++) {
+    if (getY() + step > pageHeight - marginConfig.bottom) {
+      addNewPage();
+    }
+    if (i === 0) {
+      doc.text(prefix, marginConfig.left + itemIndent, getY());
+    }
+    doc.text(lines[i], marginConfig.left + itemIndent + prefixWidth, getY());
+    setY(getY() + step);
+  }
+}
+
+/**
  * Renders a specific DOM node block into the jsPDF canvas
  */
 async function renderNodeBlock(doc, node, ctx) {
+  if (!node) return;
   const tagName = node.tagName ? node.tagName.toUpperCase() : '';
-  const className = node.className || '';
-  const { chosenFontKey, baseFontSize, primaryInkColor, secondaryColor, marginConfig, pageWidth, pageHeight, contentWidth, lineSpacingMultiplier, isCursiveMode, getY, setY, addNewPage } = ctx;
+  const className = typeof node.className === 'string' ? node.className : '';
+  const { chosenFontKey, baseFontSize, primaryInkColor, secondaryColor, marginConfig, pageWidth, pageHeight, contentWidth, lineSpacingMultiplier, isCursiveMode, exportTheme, getY, setY, addNewPage } = ctx;
 
   // 1. Headings (H1 to H6)
   if (/^H[1-6]$/.test(tagName)) {
     const level = parseInt(tagName.charAt(1), 10);
     const headingSizes = { 1: 18, 2: 15, 3: 13, 4: 12, 5: 11, 6: 10 };
     const hSize = headingSizes[level] || 14;
+    const breakThreshold = (level <= 2) ? 22 : 16;
 
-    if (getY() + 25 > pageHeight - marginConfig.bottom) addNewPage();
+    if (getY() + breakThreshold > pageHeight - marginConfig.bottom) addNewPage();
 
     doc.setFont(chosenFontKey, 'normal');
     doc.setFontSize(isCursiveMode ? hSize + 3 : hSize);
@@ -619,19 +822,9 @@ async function renderNodeBlock(doc, node, ctx) {
   }
 
   // 3. Mathematical Formulas (KaTeX display or formula block)
-  if (className.includes('katex') || className.includes('formula-block') || node.querySelector('.katex')) {
-    const rendered = await domElementToPngDataUrl(node, 2.5);
-    if (rendered && rendered.dataUrl) {
-      const imgWidth = Math.min(contentWidth * 0.8, (rendered.width / 2.5) * 0.264);
-      const imgHeight = (rendered.height / rendered.width) * imgWidth;
-
-      if (getY() + imgHeight > pageHeight - marginConfig.bottom) addNewPage();
-
-      const posX = (pageWidth - imgWidth) / 2;
-      doc.addImage(rendered.dataUrl, 'PNG', posX, getY(), imgWidth, imgHeight);
-      setY(getY() + imgHeight + 4);
-      return;
-    }
+  if (isFormulaNode(node)) {
+    await renderFormulaBlock(doc, node, ctx);
+    return;
   }
 
   // 4. Tables (Vector table via jspdf-autotable)
@@ -689,13 +882,74 @@ async function renderNodeBlock(doc, node, ctx) {
     }
   }
 
-  // 5. Code Blocks & ASCII Diagrams (PRE, CODE, .ascii-block)
-  if (tagName === 'PRE' || tagName === 'CODE' || className.includes('ascii-block') || node.querySelector('code')) {
+  // 5. Lists (UL, OL) - Checked BEFORE code blocks to prevent lists from being swallowed
+  if (tagName === 'UL' || tagName === 'OL') {
+    const isOrdered = tagName === 'OL';
+    const startAttr = parseInt(node.getAttribute('start'), 10);
+    const startNum = (!isNaN(startAttr) && startAttr > 0) ? startAttr : 1;
+
+    // Direct children li only to avoid duplicating nested items
+    const items = Array.from(node.children).filter(el => el.tagName === 'LI');
+
+    for (let idx = 0; idx < items.length; idx++) {
+      const li = items[idx];
+      const prefix = isOrdered ? `${startNum + idx}. ` : '• ';
+
+      // Check for block-level children inside this li
+      const blockChildren = Array.from(li.children).filter(child => {
+        const cTag = child.tagName;
+        return cTag === 'P' || cTag === 'DIV' || cTag === 'BLOCKQUOTE' || cTag === 'PRE' ||
+               cTag === 'TABLE' || cTag === 'UL' || cTag === 'OL' || isFormulaNode(child);
+      });
+
+      if (blockChildren.length === 0) {
+        renderListItemText(doc, prefix, li.innerText || li.textContent || '', ctx);
+      } else {
+        let isFirstBlock = true;
+        for (const child of blockChildren) {
+          if (isFormulaNode(child)) {
+            await renderFormulaBlock(doc, child, ctx);
+          } else if (child.tagName === 'UL' || child.tagName === 'OL') {
+            await renderNodeBlock(doc, child, {
+              ...ctx,
+              marginConfig: { ...marginConfig, left: marginConfig.left + 8 },
+              contentWidth: contentWidth - 8
+            });
+          } else if (child.tagName === 'P') {
+            const pText = (child.innerText || child.textContent || '').trim();
+            if (pText) {
+              if (isFirstBlock) {
+                renderListItemText(doc, prefix, pText, ctx);
+                isFirstBlock = false;
+              } else {
+                renderTextParagraph(doc, pText, {
+                  ...ctx,
+                  marginConfig: { ...marginConfig, left: marginConfig.left + 6 },
+                  contentWidth: contentWidth - 6
+                });
+              }
+            }
+          } else {
+            await renderNodeBlock(doc, child, {
+              ...ctx,
+              marginConfig: { ...marginConfig, left: marginConfig.left + 6 },
+              contentWidth: contentWidth - 6
+            });
+          }
+        }
+      }
+      setY(getY() + (isCursiveMode ? 2 : 1.5));
+    }
+    setY(getY() + 2);
+    return;
+  }
+
+  // 6. Code Blocks & ASCII Diagrams (PRE, standalone CODE, .ascii-block)
+  if (isCodeBlockNode(node)) {
     const codeText = node.innerText || node.textContent || '';
     const rawLines = codeText.trimEnd().split('\n');
     const maxLineLen = Math.max(...rawLines.map(l => l.length), 1);
 
-    // Keep ASCII diagrams and code blocks unwrapped to preserve exact geometry
     const maxAllowedWidth = contentWidth - 8;
     const charWidthPt = (baseFontSize - 1.5) * 0.22;
     let codeFontSize = baseFontSize - 1.5;
@@ -706,7 +960,19 @@ async function renderNodeBlock(doc, node, ctx) {
     doc.setFont('FiraCode', 'normal');
     doc.setFontSize(codeFontSize);
     const lineHeight = codeFontSize * 0.44;
-    const blockHeight = rawLines.length * lineHeight + 6;
+
+    // Wrap any line that exceeds maxAllowedWidth so text never runs off into margins
+    const processedLines = [];
+    for (const rawLine of rawLines) {
+      if (doc.getTextWidth(rawLine) > maxAllowedWidth) {
+        const wrapped = doc.splitTextToSize(rawLine, maxAllowedWidth);
+        processedLines.push(...wrapped);
+      } else {
+        processedLines.push(rawLine);
+      }
+    }
+
+    const blockHeight = processedLines.length * lineHeight + 6;
 
     if (getY() + blockHeight > pageHeight - marginConfig.bottom) addNewPage();
 
@@ -717,7 +983,7 @@ async function renderNodeBlock(doc, node, ctx) {
 
     doc.setTextColor(30, 41, 59);
     let lineY = getY() + (lineHeight * 0.9) + 2;
-    for (const line of rawLines) {
+    for (const line of processedLines) {
       doc.text(line, marginConfig.left + 4, lineY);
       lineY += lineHeight;
     }
@@ -727,7 +993,7 @@ async function renderNodeBlock(doc, node, ctx) {
     return;
   }
 
-  // 6. Callout Box
+  // 7. Callout Box & Blockquotes
   if (className.includes('callout-box') || tagName === 'BLOCKQUOTE') {
     const text = node.innerText.trim();
     doc.setFont(chosenFontKey, 'normal');
@@ -756,7 +1022,7 @@ async function renderNodeBlock(doc, node, ctx) {
     return;
   }
 
-  // 6b. Neutral Chat Image Placeholder (Option A)
+  // 8. Neutral Chat Image Placeholder
   if (className.includes('chat-image-placeholder')) {
     const text = node.innerText.trim();
     doc.setFont(chosenFontKey, 'normal');
@@ -782,31 +1048,7 @@ async function renderNodeBlock(doc, node, ctx) {
     return;
   }
 
-  // 7. Lists (UL, OL, LI)
-  if (tagName === 'UL' || tagName === 'OL') {
-    const items = Array.from(node.querySelectorAll('li'));
-    items.forEach((li, idx) => {
-      const prefix = tagName === 'OL' ? `${idx + 1}. ` : '• ';
-      const itemText = prefix + li.innerText.trim();
-      renderTextParagraph(doc, itemText, {
-        chosenFontKey,
-        baseFontSize,
-        primaryInkColor,
-        marginConfig: { ...marginConfig, left: marginConfig.left + 4 },
-        pageWidth,
-        pageHeight,
-        contentWidth: contentWidth - 4,
-        lineSpacingMultiplier,
-        isCursiveMode,
-        getY,
-        setY,
-        addNewPage
-      });
-    });
-    return;
-  }
-
-  // 8. Images (IMG)
+  // 9. Images (IMG)
   if (tagName === 'IMG') {
     const src = node.getAttribute('src');
     if (src) {
