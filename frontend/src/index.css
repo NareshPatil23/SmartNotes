@@ -550,6 +550,7 @@ body {
 /* --- AI Diagram (Mermaid) Styles --- */
 .mermaid,
 .mermaid-diagram-container {
+  position: relative !important;
   display: flex;
   justify-content: center;
   align-items: center;
@@ -559,11 +560,12 @@ body {
   border-radius: 12px !important;
   border: 1px solid var(--border-color) !important;
   box-shadow: var(--shadow-sm) !important;
-  max-width: 100% !important;
+  max-width: 100%;
   overflow-x: auto !important;
   overflow-y: visible !important;
   page-break-inside: avoid !important;
   break-inside: avoid !important;
+  transition: width 0.15s ease, max-width 0.15s ease;
 }
 .mermaid svg,
 .mermaid-diagram-container svg {
@@ -611,6 +613,164 @@ body {
   background: #1e293b !important;
   border-color: #334155 !important;
   color: #f1f5f9 !important;
+}
+
+/* --- Mermaid Hover Toolbar & Controls --- */
+.mermaid-hover-toolbar {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(4px);
+  border: 1px solid var(--border-color, #e2e8f0);
+  border-radius: 6px;
+  padding: 3px 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+  user-select: none;
+}
+
+.mermaid-diagram-container:hover .mermaid-hover-toolbar {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.dark-theme .mermaid-hover-toolbar {
+  background: rgba(30, 41, 59, 0.95);
+  border-color: #334155;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.mermaid-tb-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.mermaid-tb-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--border-color, #cbd5e1);
+  margin: 0 3px;
+}
+
+.mermaid-tb-btn {
+  font-size: 11px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-color, #475569);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  line-height: 1;
+  font-family: inherit;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.mermaid-tb-btn:hover {
+  background: var(--bg-hover, #f1f5f9);
+  color: var(--text-color, #0f172a);
+}
+
+.dark-theme .mermaid-tb-btn {
+  color: #94a3b8;
+}
+
+.dark-theme .mermaid-tb-btn:hover {
+  background: #334155;
+  color: #f8fafc;
+}
+
+.mermaid-size-btn {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 6px;
+  min-width: 22px;
+  justify-content: center;
+}
+
+.mermaid-size-btn.active {
+  background: var(--bg-hover, #e2e8f0);
+  font-weight: 700;
+  color: var(--text-color, #0f172a);
+  border-color: var(--border-color, #cbd5e1);
+}
+
+.dark-theme .mermaid-size-btn.active {
+  background: #475569;
+  color: #ffffff;
+  border-color: #64748b;
+}
+
+.mermaid-delete-btn:hover {
+  color: #dc2626 !important;
+  background: #fee2e2 !important;
+}
+
+.dark-theme .mermaid-delete-btn:hover {
+  color: #f87171 !important;
+  background: #450a0a !important;
+}
+
+.mermaid-tb-btn.copied {
+  color: #16a34a !important;
+  background: #dcfce7 !important;
+}
+
+.dark-theme .mermaid-tb-btn.copied {
+  color: #4ade80 !important;
+  background: #052e16 !important;
+}
+
+/* Drag Resize Handle */
+.mermaid-resize-handle {
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  z-index: 20;
+  cursor: nwse-resize;
+  opacity: 0;
+  color: #94a3b8;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.15s ease, color 0.15s ease;
+}
+
+.mermaid-diagram-container:hover .mermaid-resize-handle {
+  opacity: 0.6;
+}
+
+.mermaid-diagram-container:hover .mermaid-resize-handle:hover {
+  opacity: 1;
+  color: #475569;
+}
+
+.dark-theme .mermaid-resize-handle {
+  color: #64748b;
+}
+
+.dark-theme .mermaid-diagram-container:hover .mermaid-resize-handle:hover {
+  color: #cbd5e1;
+}
+
+/* Hide interactive controls in print */
+@media print {
+  .mermaid-hover-toolbar,
+  .mermaid-resize-handle,
+  .mermaid-edit-panel {
+    display: none !important;
+  }
 }
 
 /* --- Neutral Informational Note for Images (Option A) --- */

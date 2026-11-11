@@ -19,7 +19,8 @@ import {
   generateGeminiContent,
   getPreferredModel,
   setPreferredModel as savePreferredModelStorage,
-  getAvailableModels
+  getAvailableModels,
+  editMermaidWithAI
 } from '../../services/geminiClient'
 import {
   DEFAULT_GEMINI_MODEL,
@@ -28,7 +29,12 @@ import {
   resolvePreferredModel
 } from '../../config/geminiConfig'
 import AiChatImportModal from './AiChatImportModal'
-import { formatAnswerWithDiagrams, hydrateMermaidContainers } from '../../utils/mermaidHelper'
+import {
+  formatAnswerWithDiagrams,
+  hydrateMermaidContainers,
+  renderMermaidSvg,
+  validateMermaidCode
+} from '../../utils/mermaidHelper'
 
 const RichEditor = lazy(() => import('../RichEditor'))
 const AuthModal = lazy(() => import('../auth/AuthModal'))
@@ -1168,6 +1174,267 @@ export default function Workspace({
     setFormatAllToast(null);
     setSaveStatus('Format All Undone ✓');
   };
+
+  // Diagram Editor side panel state
+  const [diagramEditor, setDiagramEditor] = useState({
+    isOpen: false,
+    diagramId: null,
+    container: null,
+    initialCode: '',
+    currentCode: '',
+    lastValidSvg: '',
+    widthPercent: 100,
+    syntaxError: null,
+    mode: 'edit',
+    aiInstruction: '',
+    isAiLoading: false,
+    aiError: null,
+    targetQuestionIdx: null
+  });
+
+  const previewDebounceTimerRef = useRef(null);
+
+  const updateDiagramLivePreview = useCallback(async (code) => {
+    if (!code || !code.trim()) {
+      setDiagramEditor(prev => ({ ...prev, syntaxError: 'Diagram code is empty.' }));
+      return;
+    }
+    try {
+      const res = await renderMermaidSvg(code, isDarkMode);
+      if (res && res.svg) {
+        setDiagramEditor(prev => ({
+          ...prev,
+          lastValidSvg: res.svg,
+          syntaxError: null
+        }));
+      } else {
+        setDiagramEditor(prev => ({
+          ...prev,
+          syntaxError: res?.error || 'Syntax error in Mermaid code.'
+        }));
+      }
+    } catch (err) {
+      setDiagramEditor(prev => ({
+        ...prev,
+        syntaxError: err.message || 'Syntax error in Mermaid code.'
+      }));
+    }
+  }, [isDarkMode]);
+
+  const handleDiagramCodeChange = (newCode) => {
+    setDiagramEditor(prev => ({ ...prev, currentCode: newCode }));
+    if (previewDebounceTimerRef.current) {
+      clearTimeout(previewDebounceTimerRef.current);
+    }
+    previewDebounceTimerRef.current = setTimeout(() => {
+      updateDiagramLivePreview(newCode);
+    }, 400);
+  };
+
+  const handleDiagramAiEdit = async () => {
+    if (!diagramEditor.aiInstruction || !diagramEditor.aiInstruction.trim()) return;
+    const key = getStoredApiKey();
+    if (!key) {
+      setShowKeyModal(true);
+      return;
+    }
+
+    setDiagramEditor(prev => ({ ...prev, isAiLoading: true, aiError: null }));
+
+    try {
+      const result = await editMermaidWithAI({
+        currentCode: diagramEditor.currentCode,
+        instruction: diagramEditor.aiInstruction,
+        model: preferredModel,
+        apiKey: key,
+        validateFn: validateMermaidCode
+      });
+
+      if (result.success && result.code) {
+        setDiagramEditor(prev => ({
+          ...prev,
+          currentCode: result.code,
+          isAiLoading: false,
+          aiError: null,
+          aiInstruction: ''
+        }));
+        updateDiagramLivePreview(result.code);
+      } else {
+        setDiagramEditor(prev => ({
+          ...prev,
+          isAiLoading: false,
+          aiError: result.error || 'Failed to update diagram with AI.'
+        }));
+      }
+    } catch (err) {
+      setDiagramEditor(prev => ({
+        ...prev,
+        isAiLoading: false,
+        aiError: err.message || 'Error communicating with AI service.'
+      }));
+    }
+  };
+
+  const handleSaveDiagram = () => {
+    const { container, diagramId, currentCode, initialCode, targetQuestionIdx } = diagramEditor;
+    if (!currentCode.trim()) return;
+
+    const encodedNewCode = encodeURIComponent(currentCode.trim());
+    const encodedOldCode = encodeURIComponent(initialCode.trim());
+
+    if (container) {
+      container.setAttribute('data-previous-code', encodedOldCode);
+      container.setAttribute('data-mermaid-code', encodedNewCode);
+      container.removeAttribute('data-rendered');
+      hydrateMermaidContainers(container.parentElement || document.body, isDarkMode);
+    }
+
+    if (richEditorRef.current) {
+      const content = richEditorRef.current.getContent();
+      if (content && (content.includes(diagramId) || content.includes(encodedOldCode))) {
+        const temp = document.createElement('div');
+        temp.innerHTML = content;
+        const target = diagramId ? temp.querySelector(`[data-diagram-id="${diagramId}"]`) : temp.querySelector(`[data-mermaid-code="${encodedOldCode}"]`);
+        if (target) {
+          target.setAttribute('data-mermaid-code', encodedNewCode);
+          target.setAttribute('data-previous-code', encodedOldCode);
+          richEditorRef.current.setContent(temp.innerHTML);
+        }
+      }
+    }
+
+    setQuestions(prev => prev.map((q, idx) => {
+      const isTarget = targetQuestionIdx !== null ? idx === targetQuestionIdx : idx === activeQuestionIdx;
+      if (isTarget || (q.answer && (q.answer.includes(diagramId) || q.answer.includes(encodedOldCode)))) {
+        const temp = document.createElement('div');
+        temp.innerHTML = q.answer;
+        const target = diagramId ? temp.querySelector(`[data-diagram-id="${diagramId}"]`) : temp.querySelector(`[data-mermaid-code="${encodedOldCode}"]`);
+        if (target) {
+          target.setAttribute('data-mermaid-code', encodedNewCode);
+          target.setAttribute('data-previous-code', encodedOldCode);
+          return { ...q, answer: temp.innerHTML };
+        }
+      }
+      return q;
+    }));
+
+    setSaveStatus('Saving...');
+    setDiagramEditor(prev => ({ ...prev, isOpen: false }));
+  };
+
+  useEffect(() => {
+    const onMermaidAction = (e) => {
+      const { action, container, diagramId, code, widthPercent } = e.detail || {};
+      if (!container) return;
+
+      if (action === 'edit' || action === 'edit-ai') {
+        let qIdx = activeQuestionIdx;
+        if (questions && questions.length > 0) {
+          questions.forEach((q, idx) => {
+            if (q.answer && (q.answer.includes(diagramId) || q.answer.includes(encodeURIComponent(code || '')))) {
+              qIdx = idx;
+            }
+          });
+        }
+
+        const decodedCode = code || '';
+        setDiagramEditor({
+          isOpen: true,
+          diagramId,
+          container,
+          initialCode: decodedCode,
+          currentCode: decodedCode,
+          lastValidSvg: container.querySelector('.mermaid-svg-wrapper')?.innerHTML || '',
+          widthPercent: widthPercent || 100,
+          syntaxError: null,
+          mode: action,
+          aiInstruction: '',
+          isAiLoading: false,
+          aiError: null,
+          targetQuestionIdx: qIdx
+        });
+      } else if (action === 'delete') {
+        if (previewRef.current && previewRef.current.contains(container)) {
+          const diagId = container.getAttribute('data-diagram-id');
+          setQuestions(prev => prev.map((q, idx) => {
+            if (idx === activeQuestionIdx || q.answer.includes(diagId)) {
+              const temp = document.createElement('div');
+              temp.innerHTML = q.answer;
+              const target = temp.querySelector(`[data-diagram-id="${diagId}"]`);
+              if (target) target.remove();
+              return { ...q, answer: temp.innerHTML };
+            }
+            return q;
+          }));
+          container.remove();
+          setSaveStatus('Saving...');
+        }
+      } else if (action === 'resize' || action === 'resize-end') {
+        if (previewRef.current && previewRef.current.contains(container)) {
+          const diagId = container.getAttribute('data-diagram-id');
+          const wp = String(widthPercent);
+          setQuestions(prev => prev.map((q, idx) => {
+            if (idx === activeQuestionIdx || q.answer.includes(diagId)) {
+              const temp = document.createElement('div');
+              temp.innerHTML = q.answer;
+              const target = temp.querySelector(`[data-diagram-id="${diagId}"]`);
+              if (target) {
+                target.setAttribute('data-width-percent', wp);
+                target.style.width = `${wp}%`;
+                target.style.maxWidth = `${wp}%`;
+                return { ...q, answer: temp.innerHTML };
+              }
+            }
+            return q;
+          }));
+          setSaveStatus('Saving...');
+        }
+      } else if (action === 'undo') {
+        if (previewRef.current && previewRef.current.contains(container)) {
+          const prevCode = container.getAttribute('data-previous-code');
+          const prevWidth = container.getAttribute('data-previous-width');
+          const curCode = container.getAttribute('data-mermaid-code');
+          const curWidth = container.getAttribute('data-width-percent') || '100';
+
+          if (prevCode) {
+            container.setAttribute('data-mermaid-code', prevCode);
+            container.setAttribute('data-previous-code', curCode);
+          }
+          if (prevWidth) {
+            container.setAttribute('data-width-percent', prevWidth);
+            container.setAttribute('data-previous-width', curWidth);
+            container.style.width = `${prevWidth}%`;
+            container.style.maxWidth = `${prevWidth}%`;
+          }
+          container.removeAttribute('data-rendered');
+          hydrateMermaidContainers(previewRef.current, isDarkMode);
+
+          const diagId = container.getAttribute('data-diagram-id');
+          setQuestions(prev => prev.map((q, idx) => {
+            if (idx === activeQuestionIdx || q.answer.includes(diagId)) {
+              const temp = document.createElement('div');
+              temp.innerHTML = q.answer;
+              const target = temp.querySelector(`[data-diagram-id="${diagId}"]`);
+              if (target) {
+                if (prevCode) target.setAttribute('data-mermaid-code', prevCode);
+                if (prevWidth) {
+                  target.setAttribute('data-width-percent', prevWidth);
+                  target.style.width = `${prevWidth}%`;
+                  target.style.maxWidth = `${prevWidth}%`;
+                }
+                return { ...q, answer: temp.innerHTML };
+              }
+            }
+            return q;
+          }));
+          setSaveStatus('Saving...');
+        }
+      }
+    };
+
+    window.addEventListener('mermaid-action', onMermaidAction);
+    return () => window.removeEventListener('mermaid-action', onMermaidAction);
+  }, [activeQuestionIdx, questions, isDarkMode]);
 
   const handleUpload = async (e) => {
     const file = e.target.files[0];
@@ -4847,6 +5114,196 @@ export default function Workspace({
             </div>
             <div style={{padding: '1rem', borderTop: '1px solid var(--border-color)'}}>
                <input placeholder="Ask AI to simplify, summarize..." style={{width: '100%', padding: '0.75rem', borderRadius: 8, border: '1px solid var(--border-color)', outline: 'none'}} />
+            </div>
+          </aside>
+        )}
+
+        {/* Mermaid Diagram Edit Side Panel */}
+        {diagramEditor.isOpen && (
+          <aside className="mermaid-edit-panel" style={{
+            width: 440,
+            maxWidth: '90vw',
+            borderLeft: '1px solid var(--border-color)',
+            background: 'var(--bg-card, #ffffff)',
+            display: 'flex',
+            flexDirection: 'column',
+            height: '100%',
+            overflowY: 'auto',
+            zIndex: 40,
+            boxShadow: '-4px 0 16px rgba(0, 0, 0, 0.05)'
+          }}>
+            <div className="mermaid-panel-header" style={{
+              padding: '0.85rem 1rem',
+              borderBottom: '1px solid var(--border-color)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between'
+            }}>
+              <div style={{ fontWeight: 600, fontSize: '0.95rem', display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--text-color)' }}>
+                <span>📐</span>
+                <span>Edit Diagram</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDiagramEditor(prev => ({ ...prev, isOpen: false }))}
+                style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '1.1rem', color: 'var(--text-muted)' }}
+                title="Cancel and close"
+              >✕</button>
+            </div>
+
+            <div style={{ padding: '1rem', display: 'flex', flexDirection: 'column', gap: '1rem', flex: 1 }}>
+              {/* Edit with AI Section */}
+              <div className="mermaid-ai-edit-box" style={{
+                background: 'var(--bg-hover, #f8fafc)',
+                border: '1px solid var(--border-color)',
+                borderRadius: '8px',
+                padding: '0.75rem'
+              }}>
+                <div style={{ fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.4rem', display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-color)' }}>
+                  <span>✨</span>
+                  <span>Edit with AI</span>
+                </div>
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                  <input
+                    type="text"
+                    value={diagramEditor.aiInstruction}
+                    onChange={(e) => setDiagramEditor(prev => ({ ...prev, aiInstruction: e.target.value }))}
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleDiagramAiEdit(); }}
+                    placeholder="Describe change (e.g. Add validation step)..."
+                    disabled={diagramEditor.isAiLoading}
+                    style={{
+                      flex: 1,
+                      padding: '0.45rem 0.6rem',
+                      fontSize: '0.85rem',
+                      border: '1px solid var(--border-color)',
+                      borderRadius: '6px',
+                      background: 'var(--bg-card, #ffffff)',
+                      color: 'var(--text-color)'
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleDiagramAiEdit}
+                    disabled={diagramEditor.isAiLoading || !diagramEditor.aiInstruction.trim()}
+                    style={{
+                      padding: '0.45rem 0.85rem',
+                      fontSize: '0.85rem',
+                      fontWeight: 500,
+                      borderRadius: '6px',
+                      border: '1px solid var(--border-color)',
+                      background: 'var(--primary-color, #4f46e5)',
+                      color: '#ffffff',
+                      cursor: diagramEditor.isAiLoading ? 'wait' : 'pointer',
+                      whiteSpace: 'nowrap'
+                    }}
+                  >
+                    {diagramEditor.isAiLoading ? 'Updating...' : 'Apply'}
+                  </button>
+                </div>
+                {diagramEditor.aiError && (
+                  <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: '#dc2626', background: '#fef2f2', padding: '0.4rem 0.6rem', borderRadius: '4px', border: '1px solid #fecaca' }}>
+                    ⚠️ {diagramEditor.aiError}
+                  </div>
+                )}
+              </div>
+
+              {/* Mermaid Source Code Textarea */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-color)' }}>Mermaid Source Code</label>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>400ms live preview</span>
+                </div>
+                <textarea
+                  value={diagramEditor.currentCode}
+                  onChange={(e) => handleDiagramCodeChange(e.target.value)}
+                  rows={8}
+                  style={{
+                    width: '100%',
+                    fontFamily: "'Fira Code', 'Courier New', monospace",
+                    fontSize: '0.8rem',
+                    lineHeight: '1.45',
+                    padding: '0.6rem',
+                    border: '1px solid var(--border-color)',
+                    borderRadius: '6px',
+                    background: 'var(--bg-card, #ffffff)',
+                    color: 'var(--text-color)',
+                    resize: 'vertical',
+                    boxSizing: 'border-box'
+                  }}
+                />
+                {diagramEditor.syntaxError && (
+                  <div className="mermaid-panel-syntax-error" style={{
+                    fontSize: '0.75rem',
+                    color: '#b91c1c',
+                    background: '#fef2f2',
+                    border: '1px solid #fca5a5',
+                    borderRadius: '4px',
+                    padding: '0.4rem 0.6rem',
+                    lineHeight: '1.3'
+                  }}>
+                    ⚠️ Syntax error: {diagramEditor.syntaxError}
+                  </div>
+                )}
+              </div>
+
+              {/* Live Preview */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', flex: 1 }}>
+                <label style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-color)' }}>Live Preview</label>
+                <div
+                  className="mermaid-panel-preview"
+                  style={{
+                    flex: 1,
+                    minHeight: '200px',
+                    border: '1px solid var(--border-color)',
+                    borderRadius: '6px',
+                    padding: '0.75rem',
+                    background: '#ffffff',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    overflow: 'auto'
+                  }}
+                  dangerouslySetInnerHTML={{ __html: diagramEditor.lastValidSvg || '<div style="color: #94a3b8; font-size: 0.8rem;">Diagram preview appears here...</div>' }}
+                />
+              </div>
+            </div>
+
+            {/* Panel Footer */}
+            <div className="mermaid-panel-footer" style={{
+              padding: '0.75rem 1rem',
+              borderTop: '1px solid var(--border-color)',
+              display: 'flex',
+              justifyContent: 'flex-end',
+              gap: '0.5rem',
+              background: 'var(--bg-card, #ffffff)'
+            }}>
+              <button
+                type="button"
+                onClick={() => setDiagramEditor(prev => ({ ...prev, isOpen: false }))}
+                style={{
+                  padding: '0.45rem 0.9rem',
+                  fontSize: '0.85rem',
+                  borderRadius: '6px',
+                  border: '1px solid var(--border-color)',
+                  background: 'transparent',
+                  color: 'var(--text-color)',
+                  cursor: 'pointer'
+                }}
+              >Cancel</button>
+              <button
+                type="button"
+                onClick={handleSaveDiagram}
+                style={{
+                  padding: '0.45rem 1rem',
+                  fontSize: '0.85rem',
+                  fontWeight: 500,
+                  borderRadius: '6px',
+                  border: 'none',
+                  background: 'var(--primary-color, #4f46e5)',
+                  color: '#ffffff',
+                  cursor: 'pointer'
+                }}
+              >Save Diagram</button>
             </div>
           </aside>
         )}

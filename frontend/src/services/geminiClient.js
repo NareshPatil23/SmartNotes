@@ -670,3 +670,135 @@ Output ONLY a raw valid JSON array:
     throw new Error('AI returned an unexpected format. Please try again.');
   }
 }
+
+/**
+ * Strips code fences and backticks from AI output to get raw Mermaid code.
+ */
+export function stripMermaidFences(rawText) {
+  if (!rawText || typeof rawText !== 'string') return '';
+  let cleaned = rawText.trim();
+  // Remove markdown fences: ```mermaid ... ``` or ``` ... ```
+  cleaned = cleaned.replace(/^```(?:mermaid|flowchart|sequenceDiagram|graph)?\s*\r?\n?/i, '');
+  cleaned = cleaned.replace(/\r?\n?```\s*$/i, '');
+  return cleaned.trim();
+}
+
+/**
+ * Edit Mermaid diagram using Gemini AI with central config, 429 backoff, and 1-attempt syntax retry.
+ *
+ * @param {{
+ *   currentCode: string,
+ *   instruction: string,
+ *   model?: string,
+ *   apiKey?: string,
+ *   validateFn?: (code: string) => Promise<{ valid: boolean, error?: string }>
+ * }} opts
+ * @returns {Promise<{ success: boolean, code: string, error?: string }>}
+ */
+export async function editMermaidWithAI({
+  currentCode,
+  instruction,
+  model = null,
+  apiKey = null,
+  validateFn = null
+}) {
+  if (!instruction || !instruction.trim()) {
+    throw new Error('Please describe the change you want to make.');
+  }
+  if (!currentCode || !currentCode.trim()) {
+    throw new Error('No diagram code provided to edit.');
+  }
+
+  const systemInstruction = `You are an expert Mermaid diagram developer.
+Given existing Mermaid diagram code and a modification instruction, produce the updated Mermaid diagram code.
+
+CRITICAL RULES:
+1. Return ONLY the raw valid Mermaid diagram code.
+2. Do NOT wrap in markdown code blocks or triple backticks (\`\`\`mermaid or \`\`\`).
+3. Do NOT include any explanations, markdown headers, conversational prose, or greetings.
+4. Ensure the syntax is 100% valid Mermaid code.`;
+
+  const prompt = `Current Mermaid Diagram Code:
+${currentCode.trim()}
+
+Requested Change:
+${instruction.trim()}
+
+Provide ONLY the updated valid Mermaid diagram code:`;
+
+  const callWithBackoff = async (pText) => {
+    const MAX_RETRIES = 3;
+    let delay = 1000;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        return await generateGeminiContent({
+          prompt: pText,
+          systemInstruction,
+          model,
+          apiKey
+        });
+      } catch (err) {
+        const is429 = err.status === 429 ||
+          (err.message || '').toLowerCase().includes('quota') ||
+          (err.message || '').toLowerCase().includes('rate limit') ||
+          (err.message || '').toLowerCase().includes('resource_exhausted') ||
+          (err.message || '').toLowerCase().includes('429');
+
+        if (is429 && attempt < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, delay));
+          delay *= 2;
+          continue;
+        }
+        throw err;
+      }
+    }
+  };
+
+  // 1. Initial attempt
+  const firstRaw = await callWithBackoff(prompt);
+  let cleanedCode = stripMermaidFences(firstRaw);
+
+  // 2. Validate with validator if provided
+  if (typeof validateFn === 'function') {
+    const validation = await validateFn(cleanedCode);
+    if (!validation.valid) {
+      // 3. Retry once if invalid
+      const retryPrompt = `The previous attempt to update the Mermaid diagram produced a syntax error:
+"${validation.error || 'Syntax error'}"
+
+Original Mermaid diagram:
+${currentCode.trim()}
+
+Requested change:
+${instruction.trim()}
+
+Attempt with error:
+${cleanedCode}
+
+Please fix the error and output ONLY the 100% valid Mermaid diagram code without backticks or explanations:`;
+
+      try {
+        const retryRaw = await callWithBackoff(retryPrompt);
+        const retryCleaned = stripMermaidFences(retryRaw);
+        const secondValidation = await validateFn(retryCleaned);
+        if (secondValidation.valid) {
+          return { success: true, code: retryCleaned };
+        } else {
+          return {
+            success: false,
+            code: currentCode,
+            error: secondValidation.error || 'AI returned invalid Mermaid diagram syntax'
+          };
+        }
+      } catch (retryErr) {
+        return {
+          success: false,
+          code: currentCode,
+          error: retryErr.message || 'Retry attempt failed'
+        };
+      }
+    }
+  }
+
+  return { success: true, code: cleanedCode };
+}

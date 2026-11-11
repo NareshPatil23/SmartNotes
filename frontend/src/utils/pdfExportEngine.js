@@ -165,6 +165,9 @@ async function prepareExportMermaidDiagrams(exportDom) {
       return;
     }
 
+    // Strip any interactive editing controls from cloned export DOM
+    container.querySelectorAll('[data-diagram-controls="true"], .mermaid-hover-toolbar, .mermaid-resize-handle').forEach(el => el.remove());
+
     const svg = container.querySelector('svg');
     if (!svg) return;
 
@@ -180,6 +183,13 @@ async function prepareExportMermaidDiagrams(exportDom) {
         img.style.margin = '0 auto';
         img.setAttribute('data-original-width', String(pngResult.width));
         img.setAttribute('data-original-height', String(pngResult.height));
+
+        const widthPercentAttr = container.getAttribute('data-width-percent');
+        if (widthPercentAttr) {
+          img.setAttribute('data-width-percent', widthPercentAttr);
+          img.style.maxWidth = `${widthPercentAttr}%`;
+          img.style.width = `${widthPercentAttr}%`;
+        }
 
         // Clean out internal SVG and <style> tags completely to avoid text leaks
         container.innerHTML = '';
@@ -932,7 +942,21 @@ async function renderNodeBlock(doc, node, ctx) {
 
     if (dataUrl && width > 0 && height > 0) {
       const maxPdfHeight = pageHeight - marginConfig.top - marginConfig.bottom - 15;
-      let imgWidth = Math.min(contentWidth, 160);
+      let baseWidth = Math.min(contentWidth, 160);
+
+      // Check saved width percent (e.g. S=40%, M=70%, L=100% or custom drag percent)
+      const containerEl = (node.classList && (node.classList.contains('mermaid-diagram-container') || node.classList.contains('mermaid')))
+        ? node
+        : (node.closest ? node.closest('.mermaid-diagram-container, .mermaid') : null);
+      const widthPercentVal = containerEl?.getAttribute?.('data-width-percent') ||
+        node.getAttribute?.('data-width-percent') ||
+        imgEl?.getAttribute?.('data-width-percent');
+      const widthPercent = parseFloat(widthPercentVal);
+      if (!isNaN(widthPercent) && widthPercent > 0 && widthPercent <= 100) {
+        baseWidth = baseWidth * (widthPercent / 100);
+      }
+
+      let imgWidth = baseWidth;
       let imgHeight = (height / width) * imgWidth;
 
       // Prevent cut-off: if diagram height exceeds full page printable area, scale proportionally

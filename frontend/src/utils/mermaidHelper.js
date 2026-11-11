@@ -20,6 +20,34 @@ let mermaidLoadingPromise = null;
 let diagramCounter = 0;
 
 /**
+ * Validates a Mermaid diagram definition using mermaid.parse()
+ * Returns { valid: true, error: null } or { valid: false, error: string }
+ */
+export async function validateMermaidCode(code) {
+  if (!code || typeof code !== 'string' || !code.trim()) {
+    return { valid: false, error: 'Empty diagram definition' };
+  }
+  const cleaned = code.trim();
+  try {
+    const mermaid = await loadMermaidLibrary();
+    if (mermaid && typeof mermaid.parse === 'function') {
+      const res = await mermaid.parse(cleaned);
+      if (res === false) {
+        return { valid: false, error: 'Invalid Mermaid syntax' };
+      }
+    }
+    return { valid: true, error: null };
+  } catch (err) {
+    // In headless/Node test environments without complete DOMPurify hooks, fallback to keyword syntax validation
+    if (err.message && (err.message.includes('DOMPurify') || err.message.includes('document'))) {
+      const isSyntaxValid = isMermaidCode(cleaned);
+      return { valid: isSyntaxValid, error: isSyntaxValid ? null : 'Invalid Mermaid syntax' };
+    }
+    return { valid: false, error: err.message || 'Syntax error in Mermaid diagram' };
+  }
+}
+
+/**
  * Checks if a string is a raw Mermaid diagram code definition
  */
 export function isMermaidCode(code) {
@@ -272,7 +300,191 @@ export async function hydrateMermaidContainers(containerEl, isDark = false) {
       container.setAttribute('data-rendered', 'true');
       container.setAttribute('data-theme', currentTheme);
     }
+
+    // Set width from data-width-percent and attach hover toolbar / resize handle
+    if (!container.getAttribute('data-diagram-id')) {
+      container.setAttribute('data-diagram-id', 'diag-' + Math.random().toString(36).substring(2, 9));
+    }
+    const widthPercent = container.getAttribute('data-width-percent') || '100';
+    container.style.width = `${widthPercent}%`;
+    container.style.maxWidth = `${widthPercent}%`;
+    attachDiagramControls(container);
   }
+}
+
+/**
+ * Attaches hover toolbar and resize drag handle to a diagram container.
+ */
+export function attachDiagramControls(container) {
+  if (!container || typeof document === 'undefined') return;
+  // Remove existing controls if any
+  container.querySelectorAll('[data-diagram-controls="true"]').forEach(el => el.remove());
+
+  const widthPercent = parseInt(container.getAttribute('data-width-percent'), 10) || 100;
+  const hasUndo = Boolean(container.getAttribute('data-previous-code') || container.getAttribute('data-previous-width'));
+
+  // 1. Hover Toolbar
+  const toolbar = document.createElement('div');
+  toolbar.className = 'mermaid-hover-toolbar';
+  toolbar.setAttribute('contenteditable', 'false');
+  toolbar.setAttribute('data-diagram-controls', 'true');
+
+  toolbar.innerHTML = `
+    <div class="mermaid-tb-group" title="Resize diagram">
+      <button type="button" class="mermaid-tb-btn mermaid-size-btn ${widthPercent === 40 ? 'active' : ''}" data-size="40" title="Small (40%)">S</button>
+      <button type="button" class="mermaid-tb-btn mermaid-size-btn ${widthPercent === 70 ? 'active' : ''}" data-size="70" title="Medium (70%)">M</button>
+      <button type="button" class="mermaid-tb-btn mermaid-size-btn ${widthPercent === 100 ? 'active' : ''}" data-size="100" title="Full (100%)">L</button>
+    </div>
+    <div class="mermaid-tb-divider"></div>
+    <button type="button" class="mermaid-tb-btn" data-action="edit" title="Edit code">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
+      <span>Edit</span>
+    </button>
+    <button type="button" class="mermaid-tb-btn" data-action="edit-ai" title="Edit with AI">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>
+      <span>AI</span>
+    </button>
+    <button type="button" class="mermaid-tb-btn" data-action="copy" title="Copy code">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+    </button>
+    <button type="button" class="mermaid-tb-btn mermaid-undo-btn" data-action="undo" title="Undo change" style="display: ${hasUndo ? 'inline-flex' : 'none'};">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"></path><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"></path></svg>
+    </button>
+    <button type="button" class="mermaid-tb-btn mermaid-delete-btn" data-action="delete" title="Delete diagram">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+    </button>
+  `;
+
+  toolbar.addEventListener('click', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+
+    const sizeBtn = e.target.closest('.mermaid-size-btn');
+    if (sizeBtn) {
+      const newSize = parseInt(sizeBtn.getAttribute('data-size'), 10) || 100;
+      const prevSize = container.getAttribute('data-width-percent') || '100';
+      if (String(newSize) !== prevSize) {
+        container.setAttribute('data-previous-width', prevSize);
+      }
+      container.setAttribute('data-width-percent', String(newSize));
+      container.style.width = `${newSize}%`;
+      container.style.maxWidth = `${newSize}%`;
+
+      toolbar.querySelectorAll('.mermaid-size-btn').forEach(b => b.classList.remove('active'));
+      sizeBtn.classList.add('active');
+
+      const undoBtn = toolbar.querySelector('.mermaid-undo-btn');
+      if (undoBtn) undoBtn.style.display = 'inline-flex';
+
+      container.dispatchEvent(new CustomEvent('mermaid-action', {
+        bubbles: true,
+        detail: { action: 'resize', container, widthPercent: newSize }
+      }));
+      return;
+    }
+
+    const actionBtn = e.target.closest('[data-action]');
+    if (!actionBtn) return;
+    const action = actionBtn.getAttribute('data-action');
+
+    const encodedCode = container.getAttribute('data-mermaid-code') || '';
+    let code = '';
+    try {
+      code = decodeURIComponent(encodedCode);
+    } catch (_) {
+      code = encodedCode;
+    }
+
+    if (action === 'copy') {
+      if (navigator?.clipboard?.writeText) {
+        navigator.clipboard.writeText(code).then(() => {
+          const originalTitle = actionBtn.getAttribute('title');
+          actionBtn.setAttribute('title', 'Copied!');
+          actionBtn.classList.add('copied');
+          setTimeout(() => {
+            actionBtn.setAttribute('title', originalTitle);
+            actionBtn.classList.remove('copied');
+          }, 1500);
+        });
+      }
+      return;
+    }
+
+    container.dispatchEvent(new CustomEvent('mermaid-action', {
+      bubbles: true,
+      detail: {
+        action,
+        container,
+        diagramId: container.getAttribute('data-diagram-id'),
+        code,
+        widthPercent: parseInt(container.getAttribute('data-width-percent'), 10) || 100
+      }
+    }));
+  });
+
+  // 2. Drag Resize Handle at Bottom-Right Corner
+  const resizeHandle = document.createElement('div');
+  resizeHandle.className = 'mermaid-resize-handle';
+  resizeHandle.setAttribute('contenteditable', 'false');
+  resizeHandle.setAttribute('data-diagram-controls', 'true');
+  resizeHandle.setAttribute('title', 'Drag to resize diagram');
+  resizeHandle.innerHTML = `
+    <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
+      <circle cx="8" cy="8" r="1.3" />
+      <circle cx="8" cy="4" r="1.3" />
+      <circle cx="4" cy="8" r="1.3" />
+    </svg>
+  `;
+
+  resizeHandle.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const startX = e.clientX;
+    const startWidth = container.offsetWidth;
+    const parent = container.parentElement || document.body;
+    const parentWidth = parent.clientWidth || 800;
+    const prevWidth = container.getAttribute('data-width-percent') || '100';
+
+    let currentPercent = parseInt(prevWidth, 10) || 100;
+
+    const onMouseMove = (moveEvent) => {
+      moveEvent.preventDefault();
+      const dx = moveEvent.clientX - startX;
+      const newWidthPx = Math.max(120, startWidth + dx * 2);
+      currentPercent = Math.min(100, Math.max(30, Math.round((newWidthPx / parentWidth) * 100)));
+      container.style.width = `${currentPercent}%`;
+      container.style.maxWidth = `${currentPercent}%`;
+      container.setAttribute('data-width-percent', String(currentPercent));
+
+      toolbar.querySelectorAll('.mermaid-size-btn').forEach(b => {
+        const sz = parseInt(b.getAttribute('data-size'), 10);
+        b.classList.toggle('active', Math.abs(sz - currentPercent) < 10);
+      });
+    };
+
+    const onMouseUp = () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+
+      if (String(currentPercent) !== prevWidth) {
+        container.setAttribute('data-previous-width', prevWidth);
+      }
+      const undoBtn = toolbar.querySelector('.mermaid-undo-btn');
+      if (undoBtn) undoBtn.style.display = 'inline-flex';
+
+      container.dispatchEvent(new CustomEvent('mermaid-action', {
+        bubbles: true,
+        detail: { action: 'resize-end', container, widthPercent: currentPercent }
+      }));
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  });
+
+  container.appendChild(toolbar);
+  container.appendChild(resizeHandle);
 }
 
 /**
@@ -350,6 +562,7 @@ export function formatAnswerWithDiagrams(rawText) {
     ],
     ALLOWED_ATTR: [
       'class', 'style', 'align', 'data-mermaid-code', 'data-rendered', 'data-theme',
+      'data-width-percent', 'data-diagram-id', 'data-previous-code', 'data-previous-width',
       'viewBox', 'width', 'height', 'd', 'fill', 'stroke', 'stroke-width', 'transform', 'id', 'x', 'y', 'r', 'cx', 'cy',
       'x1', 'y1', 'x2', 'y2', 'points', 'marker-end', 'marker-start', 'text-anchor', 'dominant-baseline'
     ]

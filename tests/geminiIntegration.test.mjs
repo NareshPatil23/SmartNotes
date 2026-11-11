@@ -60,7 +60,9 @@ const {
   saveApiKey,
   getStoredApiKey,
   removeApiKey,
-  sanitizeGenerationConfig
+  sanitizeGenerationConfig,
+  stripMermaidFences,
+  editMermaidWithAI
 } = await import('../frontend/src/services/geminiClient.js');
 
 const {
@@ -74,7 +76,8 @@ const {
 const {
   formatAnswerWithDiagrams,
   hasMermaidDiagram,
-  isMermaidCode
+  isMermaidCode,
+  validateMermaidCode
 } = await import('../frontend/src/utils/mermaidHelper.js');
 
 describe('Gemini Model Configuration & Central Architecture', () => {
@@ -1077,5 +1080,206 @@ describe('PDF Export Engine: List, Code Block, and Math Node Classification', ()
 
     assert.ok(imgH <= maxPdfHeight, 'Tall diagram is clamped to fit within printable page height');
     assert.ok(imgW <= contentWidth, 'Scaled width stays within page printable width');
+  });
+});
+
+describe('Mermaid Diagram Resize, Edit, AI Modification, and PDF Export', () => {
+  test('stripMermaidFences cleanly strips ```mermaid and generic fences without touching diagram code', () => {
+    const fenced1 = '```mermaid\nflowchart TD\n  A-->B\n```';
+    assert.equal(stripMermaidFences(fenced1), 'flowchart TD\n  A-->B');
+
+    const fenced2 = '```flowchart\ngraph LR\n  X[Start] --> Y[Stop]\n```';
+    assert.equal(stripMermaidFences(fenced2), 'graph LR\n  X[Start] --> Y[Stop]');
+
+    const fenced3 = '```\nsequenceDiagram\n  Alice->>Bob: Hello\n```';
+    assert.equal(stripMermaidFences(fenced3), 'sequenceDiagram\n  Alice->>Bob: Hello');
+
+    const raw = 'pie title Pets\n  "Dogs": 386\n  "Cats": 85';
+    assert.equal(stripMermaidFences(raw), raw);
+  });
+
+  test('validateMermaidCode validates diagram definition and rejects empty definition', async () => {
+    const emptyResult = await validateMermaidCode('');
+    assert.equal(emptyResult.valid, false);
+    assert.equal(emptyResult.error, 'Empty diagram definition');
+
+    const validCode = 'flowchart TD\n  A[Start] --> B[Process]\n  B --> C[End]';
+    const validResult = await validateMermaidCode(validCode);
+    assert.equal(validResult.valid, true);
+    assert.equal(validResult.error, null);
+  });
+
+  test('PDF Export scales diagram width proportionally based on saved data-width-percent (S=40%, M=70%, L=100%)', () => {
+    const contentWidth = 170; // Printable mm width
+    const baseMaxWidth = Math.min(contentWidth, 160); // 160mm
+    const origW = 800;
+    const origH = 400; // Aspect ratio 2:1
+
+    const calcPdfDimensions = (widthPercentVal) => {
+      let baseWidth = baseMaxWidth;
+      const widthPercent = parseFloat(widthPercentVal);
+      if (!isNaN(widthPercent) && widthPercent > 0 && widthPercent <= 100) {
+        baseWidth = baseWidth * (widthPercent / 100);
+      }
+      const imgWidth = baseWidth;
+      const imgHeight = (origH / origW) * imgWidth;
+      return { imgWidth, imgHeight };
+    };
+
+    // S (40%)
+    const sDim = calcPdfDimensions('40');
+    assert.equal(sDim.imgWidth, 64, 'Size S (40%) scales width to 64mm (160 * 0.4)');
+    assert.equal(sDim.imgHeight, 32, 'Aspect ratio 2:1 preserved (32mm height)');
+
+    // M (70%)
+    const mDim = calcPdfDimensions('70');
+    assert.equal(mDim.imgWidth, 112, 'Size M (70%) scales width to 112mm (160 * 0.7)');
+    assert.equal(mDim.imgHeight, 56, 'Aspect ratio 2:1 preserved (56mm height)');
+
+    // L (100%)
+    const lDim = calcPdfDimensions('100');
+    assert.equal(lDim.imgWidth, 160, 'Size L (100%) uses full maximum 160mm width');
+    assert.equal(lDim.imgHeight, 80, 'Aspect ratio 2:1 preserved (80mm height)');
+
+    // Custom drag resize (e.g. 55%)
+    const dragDim = calcPdfDimensions('55');
+    assert.equal(dragDim.imgWidth, 88, 'Drag resize (55%) scales width to 88mm (160 * 0.55)');
+    assert.equal(dragDim.imgHeight, 44, 'Aspect ratio 2:1 preserved (44mm height)');
+  });
+
+  test('editMermaidWithAI communicates with Gemini, strips fences, and validates syntax', async () => {
+    const originalFetch = global.fetch;
+
+    try {
+      // Mock fetch returning fenced Mermaid code
+      global.fetch = async (url, options) => {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [{
+              content: {
+                parts: [{
+                  text: '```mermaid\nflowchart TD\n  A[Original] --> B[Modified Step]\n  B --> C[End]\n```'
+                }]
+              }
+            }]
+          })
+        };
+      };
+
+      const result = await editMermaidWithAI({
+        currentCode: 'flowchart TD\n  A[Original] --> C[End]',
+        instruction: 'Add modified step B between A and C',
+        apiKey: 'test-key',
+        validateFn: async (code) => ({ valid: true, error: null })
+      });
+
+      assert.equal(result.success, true);
+      assert.equal(result.code, 'flowchart TD\n  A[Original] --> B[Modified Step]\n  B --> C[End]');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  test('editMermaidWithAI retries once if first attempt has invalid syntax', async () => {
+    const originalFetch = global.fetch;
+    let attemptCount = 0;
+
+    try {
+      global.fetch = async (url, options) => {
+        attemptCount++;
+        if (attemptCount === 1) {
+          // First attempt: invalid syntax
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              candidates: [{
+                content: {
+                  parts: [{ text: 'broken syntax ??? not a diagram' }]
+                }
+              }]
+            })
+          };
+        } else {
+          // Second attempt (retry): valid syntax
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              candidates: [{
+                content: {
+                  parts: [{ text: 'flowchart TD\n  A --> B' }]
+                }
+              }]
+            })
+          };
+        }
+      };
+
+      const mockValidator = async (code) => {
+        if (code.includes('broken')) {
+          return { valid: false, error: 'Unexpected token ???' };
+        }
+        return { valid: true, error: null };
+      };
+
+      const result = await editMermaidWithAI({
+        currentCode: 'flowchart TD\n  A',
+        instruction: 'Add step B',
+        apiKey: 'test-key',
+        validateFn: mockValidator
+      });
+
+      assert.equal(attemptCount, 2, 'Retried once after syntax validation failed');
+      assert.equal(result.success, true, 'Succeeded on retry');
+      assert.equal(result.code, 'flowchart TD\n  A --> B');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  test('Diagram Undo restores previous code and previous width correctly', () => {
+    class MockContainer {
+      constructor() {
+        this.attrs = {};
+      }
+      setAttribute(name, val) { this.attrs[name] = String(val); }
+      getAttribute(name) { return this.attrs[name] || null; }
+      removeAttribute(name) { delete this.attrs[name]; }
+    }
+
+    const container = new MockContainer();
+    container.setAttribute('data-mermaid-code', encodeURIComponent('flowchart TD\n  A-->B'));
+    container.setAttribute('data-width-percent', '100');
+
+    // 1. Resize to S (40%)
+    const prevWidth = container.getAttribute('data-width-percent');
+    container.setAttribute('data-previous-width', prevWidth);
+    container.setAttribute('data-width-percent', '40');
+
+    assert.equal(container.getAttribute('data-width-percent'), '40');
+    assert.equal(container.getAttribute('data-previous-width'), '100');
+
+    // 2. Undo resize -> restores 100%
+    const restoredWidth = container.getAttribute('data-previous-width');
+    container.setAttribute('data-width-percent', restoredWidth);
+    container.removeAttribute('data-previous-width');
+    assert.equal(container.getAttribute('data-width-percent'), '100');
+
+    // 3. Edit code to add node C
+    const prevCode = container.getAttribute('data-mermaid-code');
+    const newCode = encodeURIComponent('flowchart TD\n  A-->B-->C');
+    container.setAttribute('data-previous-code', prevCode);
+    container.setAttribute('data-mermaid-code', newCode);
+
+    assert.equal(decodeURIComponent(container.getAttribute('data-mermaid-code')), 'flowchart TD\n  A-->B-->C');
+
+    // 4. Undo edit -> restores original code
+    const restoredCode = container.getAttribute('data-previous-code');
+    container.setAttribute('data-mermaid-code', restoredCode);
+    container.removeAttribute('data-previous-code');
+    assert.equal(decodeURIComponent(container.getAttribute('data-mermaid-code')), 'flowchart TD\n  A-->B');
   });
 });

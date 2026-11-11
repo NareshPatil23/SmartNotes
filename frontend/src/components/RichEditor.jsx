@@ -55,9 +55,16 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
     setShowToolbar(true);
   }, []);
 
+  const getCleanHtml = useCallback(() => {
+    if (!editorRef.current) return '';
+    const clone = editorRef.current.cloneNode(true);
+    clone.querySelectorAll('[data-diagram-controls="true"]').forEach(el => el.remove());
+    return clone.innerHTML;
+  }, []);
+
   const handleInput = () => {
     if (onChange) {
-      onChange(editorRef.current.innerHTML);
+      onChange(getCleanHtml());
     }
   };
 
@@ -202,9 +209,52 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
     }
   }, [initialValue]);
 
+  // Handle diagram actions occurring inside the editor
+  useEffect(() => {
+    const editorEl = editorRef.current;
+    if (!editorEl) return;
+
+    const handleDiagramAction = (e) => {
+      const { action, container } = e.detail || {};
+      if (!container || !editorEl.contains(container)) return;
+
+      if (action === 'resize' || action === 'resize-end') {
+        handleInput();
+      } else if (action === 'delete') {
+        container.remove();
+        handleInput();
+      } else if (action === 'undo') {
+        const prevCode = container.getAttribute('data-previous-code');
+        const prevWidth = container.getAttribute('data-previous-width');
+        const curCode = container.getAttribute('data-mermaid-code');
+        const curWidth = container.getAttribute('data-width-percent') || '100';
+
+        if (prevCode) {
+          container.setAttribute('data-mermaid-code', prevCode);
+          container.setAttribute('data-previous-code', curCode);
+        }
+        if (prevWidth) {
+          container.setAttribute('data-width-percent', prevWidth);
+          container.setAttribute('data-previous-width', curWidth);
+          container.style.width = `${prevWidth}%`;
+          container.style.maxWidth = `${prevWidth}%`;
+        }
+        container.removeAttribute('data-rendered');
+        const isDark = document.body.classList.contains('dark-theme');
+        hydrateMermaidContainers(editorEl, isDark);
+        handleInput();
+      }
+    };
+
+    editorEl.addEventListener('mermaid-action', handleDiagramAction);
+    return () => {
+      editorEl.removeEventListener('mermaid-action', handleDiagramAction);
+    };
+  }, [handleInput]);
+
   useImperativeHandle(ref, () => ({
     format: applyFormat,
-    getContent: () => editorRef.current.innerHTML,
+    getContent: () => getCleanHtml(),
     setContent: (html) => {
       editorRef.current.innerHTML = html;
       handleInput();
