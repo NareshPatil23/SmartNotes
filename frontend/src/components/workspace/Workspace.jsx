@@ -20,7 +20,8 @@ import {
   getPreferredModel,
   setPreferredModel as savePreferredModelStorage,
   getAvailableModels,
-  editMermaidWithAI
+  editMermaidWithAI,
+  editCardFlowWithAI
 } from '../../services/geminiClient'
 import {
   DEFAULT_GEMINI_MODEL,
@@ -35,6 +36,12 @@ import {
   renderMermaidSvg,
   validateMermaidCode
 } from '../../utils/mermaidHelper'
+import CardFlow, { CARD_COLORS } from '../CardFlow'
+import {
+  hydrateCardFlowContainers,
+  validateCardFlowSpec,
+  VALID_CARD_COLORS
+} from '../../utils/cardFlowHelper'
 
 const RichEditor = lazy(() => import('../RichEditor'))
 const AuthModal = lazy(() => import('../auth/AuthModal'))
@@ -431,6 +438,7 @@ export default function Workspace({
     
     if (previewRef.current) {
       await hydrateMermaidContainers(previewRef.current, isDarkMode);
+      hydrateCardFlowContainers(previewRef.current, isDarkMode);
     }
     if (richEditorRef.current?.hydrateDiagrams) {
       richEditorRef.current.hydrateDiagrams();
@@ -896,6 +904,7 @@ export default function Workspace({
 
       if (previewRef.current) {
         await hydrateMermaidContainers(previewRef.current, isDarkMode);
+        hydrateCardFlowContainers(previewRef.current, isDarkMode);
       }
       setIsFormatting(false);
       setIsDoneFormatting(true);
@@ -1056,6 +1065,7 @@ export default function Workspace({
         // Live hydrate diagrams in preview
         if (previewRef.current) {
           hydrateMermaidContainers(previewRef.current, isDarkMode);
+          hydrateCardFlowContainers(previewRef.current, isDarkMode);
         }
       } else {
         // Leave original text untouched on failure
@@ -1178,10 +1188,13 @@ export default function Workspace({
   // Diagram Editor side panel state
   const [diagramEditor, setDiagramEditor] = useState({
     isOpen: false,
+    diagramType: 'mermaid', // 'mermaid' | 'cardflow'
     diagramId: null,
     container: null,
     initialCode: '',
     currentCode: '',
+    initialSpec: null,
+    currentSpec: null,
     lastValidSvg: '',
     widthPercent: 100,
     syntaxError: null,
@@ -1231,6 +1244,63 @@ export default function Workspace({
     }, 400);
   };
 
+  const handleAddCardFlowNode = () => {
+    setDiagramEditor(prev => {
+      const cur = prev.currentSpec || { type: 'flow', direction: 'vertical', nodes: [] };
+      const nodes = Array.isArray(cur.nodes) ? [...cur.nodes] : [];
+      nodes.push({ title: 'New Stage', subtitle: '', color: 'blue' });
+      return {
+        ...prev,
+        currentSpec: { ...cur, nodes },
+        syntaxError: null
+      };
+    });
+  };
+
+  const handleUpdateCardFlowNode = (index, field, value) => {
+    setDiagramEditor(prev => {
+      const cur = prev.currentSpec || { type: 'flow', direction: 'vertical', nodes: [] };
+      const nodes = Array.isArray(cur.nodes) ? [...cur.nodes] : [];
+      if (nodes[index]) {
+        nodes[index] = { ...nodes[index], [field]: value };
+      }
+      return {
+        ...prev,
+        currentSpec: { ...cur, nodes },
+        syntaxError: null
+      };
+    });
+  };
+
+  const handleMoveCardFlowNode = (index, direction) => {
+    setDiagramEditor(prev => {
+      const cur = prev.currentSpec || { type: 'flow', direction: 'vertical', nodes: [] };
+      const nodes = Array.isArray(cur.nodes) ? [...cur.nodes] : [];
+      const targetIndex = direction === 'up' ? index - 1 : index + 1;
+      if (targetIndex < 0 || targetIndex >= nodes.length) return prev;
+      const temp = nodes[index];
+      nodes[index] = nodes[targetIndex];
+      nodes[targetIndex] = temp;
+      return {
+        ...prev,
+        currentSpec: { ...cur, nodes }
+      };
+    });
+  };
+
+  const handleDeleteCardFlowNode = (index) => {
+    setDiagramEditor(prev => {
+      const cur = prev.currentSpec || { type: 'flow', direction: 'vertical', nodes: [] };
+      const nodes = Array.isArray(cur.nodes) ? [...cur.nodes] : [];
+      if (nodes.length <= 1) return prev;
+      nodes.splice(index, 1);
+      return {
+        ...prev,
+        currentSpec: { ...cur, nodes }
+      };
+    });
+  };
+
   const handleDiagramAiEdit = async () => {
     if (!diagramEditor.aiInstruction || !diagramEditor.aiInstruction.trim()) return;
     const key = getStoredApiKey();
@@ -1240,6 +1310,41 @@ export default function Workspace({
     }
 
     setDiagramEditor(prev => ({ ...prev, isAiLoading: true, aiError: null }));
+
+    if (diagramEditor.diagramType === 'cardflow') {
+      try {
+        const result = await editCardFlowWithAI({
+          currentSpec: diagramEditor.currentSpec,
+          instruction: diagramEditor.aiInstruction,
+          model: preferredModel,
+          apiKey: key
+        });
+
+        if (result.success && result.spec) {
+          setDiagramEditor(prev => ({
+            ...prev,
+            currentSpec: result.spec,
+            isAiLoading: false,
+            aiError: null,
+            aiInstruction: '',
+            syntaxError: null
+          }));
+        } else {
+          setDiagramEditor(prev => ({
+            ...prev,
+            isAiLoading: false,
+            aiError: result.error || 'Failed to update Card Flow with AI.'
+          }));
+        }
+      } catch (err) {
+        setDiagramEditor(prev => ({
+          ...prev,
+          isAiLoading: false,
+          aiError: err.message || 'Error communicating with AI service.'
+        }));
+      }
+      return;
+    }
 
     try {
       const result = await editMermaidWithAI({
@@ -1276,7 +1381,58 @@ export default function Workspace({
   };
 
   const handleSaveDiagram = () => {
-    const { container, diagramId, currentCode, initialCode, targetQuestionIdx } = diagramEditor;
+    const { container, diagramId, diagramType, currentCode, initialCode, currentSpec, initialSpec, targetQuestionIdx } = diagramEditor;
+
+    if (diagramType === 'cardflow') {
+      const val = validateCardFlowSpec(currentSpec);
+      if (!val.valid) {
+        setDiagramEditor(prev => ({ ...prev, syntaxError: val.error }));
+        return;
+      }
+      const encodedNewSpec = encodeURIComponent(JSON.stringify(val.normalizedSpec));
+      const encodedOldSpec = encodeURIComponent(JSON.stringify(initialSpec || val.normalizedSpec));
+
+      if (container) {
+        container.setAttribute('data-previous-spec', encodedOldSpec);
+        container.setAttribute('data-cardflow-spec', encodedNewSpec);
+        container.removeAttribute('data-rendered');
+        hydrateCardFlowContainers(container.parentElement || document.body, isDarkMode);
+      }
+
+      if (richEditorRef.current) {
+        const content = richEditorRef.current.getContent();
+        if (content && (content.includes(diagramId) || content.includes(encodedOldSpec))) {
+          const temp = document.createElement('div');
+          temp.innerHTML = content;
+          const target = diagramId ? temp.querySelector(`[data-diagram-id="${diagramId}"]`) : temp.querySelector(`[data-cardflow-spec="${encodedOldSpec}"]`);
+          if (target) {
+            target.setAttribute('data-cardflow-spec', encodedNewSpec);
+            target.setAttribute('data-previous-spec', encodedOldSpec);
+            richEditorRef.current.setContent(temp.innerHTML);
+          }
+        }
+      }
+
+      setQuestions(prev => prev.map((q, idx) => {
+        const isTarget = targetQuestionIdx !== null ? idx === targetQuestionIdx : idx === activeQuestionIdx;
+        if (isTarget || (q.answer && (q.answer.includes(diagramId) || q.answer.includes(encodedOldSpec)))) {
+          const temp = document.createElement('div');
+          temp.innerHTML = q.answer;
+          const target = diagramId ? temp.querySelector(`[data-diagram-id="${diagramId}"]`) : temp.querySelector(`[data-cardflow-spec="${encodedOldSpec}"]`);
+          if (target) {
+            target.setAttribute('data-cardflow-spec', encodedNewSpec);
+            target.setAttribute('data-previous-spec', encodedOldSpec);
+            return { ...q, answer: temp.innerHTML };
+          }
+        }
+        return q;
+      }));
+
+      setSaveStatus('Saving...');
+      setDiagramEditor(prev => ({ ...prev, isOpen: false }));
+      return;
+    }
+
     if (!currentCode.trim()) return;
 
     const encodedNewCode = encodeURIComponent(currentCode.trim());
@@ -1324,26 +1480,63 @@ export default function Workspace({
 
   useEffect(() => {
     const onMermaidAction = (e) => {
-      const { action, container, diagramId, code, widthPercent } = e.detail || {};
+      const { action, container, diagramId, code, spec, widthPercent, diagramType } = e.detail || {};
       if (!container) return;
 
       if (action === 'edit' || action === 'edit-ai') {
         let qIdx = activeQuestionIdx;
         if (questions && questions.length > 0) {
           questions.forEach((q, idx) => {
-            if (q.answer && (q.answer.includes(diagramId) || q.answer.includes(encodeURIComponent(code || '')))) {
+            const hasId = diagramId && q.answer && q.answer.includes(diagramId);
+            const hasCode = code && q.answer && q.answer.includes(encodeURIComponent(code));
+            const hasSpec = spec && q.answer && q.answer.includes(encodeURIComponent(JSON.stringify(spec)));
+            if (hasId || hasCode || hasSpec) {
               qIdx = idx;
             }
           });
         }
 
+        if (diagramType === 'cardflow') {
+          const fallbackSpec = {
+            type: 'flow',
+            direction: 'vertical',
+            nodes: [
+              { title: 'Step 1', subtitle: 'Initial phase', color: 'blue' },
+              { title: 'Step 2', subtitle: 'Processing', color: 'green' }
+            ]
+          };
+          const resolvedSpec = spec || fallbackSpec;
+          setDiagramEditor({
+            isOpen: true,
+            diagramType: 'cardflow',
+            diagramId,
+            container,
+            initialSpec: resolvedSpec,
+            currentSpec: resolvedSpec,
+            initialCode: '',
+            currentCode: '',
+            lastValidSvg: '',
+            widthPercent: widthPercent || 100,
+            syntaxError: null,
+            mode: action,
+            aiInstruction: '',
+            isAiLoading: false,
+            aiError: null,
+            targetQuestionIdx: qIdx
+          });
+          return;
+        }
+
         const decodedCode = code || '';
         setDiagramEditor({
           isOpen: true,
+          diagramType: 'mermaid',
           diagramId,
           container,
           initialCode: decodedCode,
           currentCode: decodedCode,
+          initialSpec: null,
+          currentSpec: null,
           lastValidSvg: container.querySelector('.mermaid-svg-wrapper')?.innerHTML || '',
           widthPercent: widthPercent || 100,
           syntaxError: null,
@@ -1391,6 +1584,47 @@ export default function Workspace({
         }
       } else if (action === 'undo') {
         if (previewRef.current && previewRef.current.contains(container)) {
+          if (diagramType === 'cardflow') {
+            const prevSpec = container.getAttribute('data-previous-spec');
+            const prevWidth = container.getAttribute('data-previous-width');
+            const curSpec = container.getAttribute('data-cardflow-spec');
+            const curWidth = container.getAttribute('data-width-percent') || '100';
+
+            if (prevSpec) {
+              container.setAttribute('data-cardflow-spec', prevSpec);
+              container.setAttribute('data-previous-spec', curSpec);
+            }
+            if (prevWidth) {
+              container.setAttribute('data-width-percent', prevWidth);
+              container.setAttribute('data-previous-width', curWidth);
+              container.style.width = `${prevWidth}%`;
+              container.style.maxWidth = `${prevWidth}%`;
+            }
+            container.removeAttribute('data-rendered');
+            hydrateCardFlowContainers(previewRef.current, isDarkMode);
+
+            const diagId = container.getAttribute('data-diagram-id');
+            setQuestions(prev => prev.map((q, idx) => {
+              if (idx === activeQuestionIdx || q.answer.includes(diagId)) {
+                const temp = document.createElement('div');
+                temp.innerHTML = q.answer;
+                const target = temp.querySelector(`[data-diagram-id="${diagId}"]`);
+                if (target) {
+                  if (prevSpec) target.setAttribute('data-cardflow-spec', prevSpec);
+                  if (prevWidth) {
+                    target.setAttribute('data-width-percent', prevWidth);
+                    target.style.width = `${prevWidth}%`;
+                    target.style.maxWidth = `${prevWidth}%`;
+                  }
+                  return { ...q, answer: temp.innerHTML };
+                }
+              }
+              return q;
+            }));
+            setSaveStatus('Saving...');
+            return;
+          }
+
           const prevCode = container.getAttribute('data-previous-code');
           const prevWidth = container.getAttribute('data-previous-width');
           const curCode = container.getAttribute('data-mermaid-code');
@@ -5118,11 +5352,11 @@ export default function Workspace({
           </aside>
         )}
 
-        {/* Mermaid Diagram Edit Side Panel */}
+        {/* Diagram Edit Side Panel (Mermaid & CardFlow) */}
         {diagramEditor.isOpen && (
           <aside className="mermaid-edit-panel" style={{
-            width: 440,
-            maxWidth: '90vw',
+            width: 460,
+            maxWidth: '92vw',
             borderLeft: '1px solid var(--border-color)',
             background: 'var(--bg-card, #ffffff)',
             display: 'flex',
@@ -5140,8 +5374,8 @@ export default function Workspace({
               justifyContent: 'space-between'
             }}>
               <div style={{ fontWeight: 600, fontSize: '0.95rem', display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--text-color)' }}>
-                <span>📐</span>
-                <span>Edit Diagram</span>
+                <span>{diagramEditor.diagramType === 'cardflow' ? '🗂️' : '📐'}</span>
+                <span>{diagramEditor.diagramType === 'cardflow' ? 'Edit Card Flow' : 'Edit Diagram'}</span>
               </div>
               <button
                 type="button"
@@ -5169,7 +5403,7 @@ export default function Workspace({
                     value={diagramEditor.aiInstruction}
                     onChange={(e) => setDiagramEditor(prev => ({ ...prev, aiInstruction: e.target.value }))}
                     onKeyDown={(e) => { if (e.key === 'Enter') handleDiagramAiEdit(); }}
-                    placeholder="Describe change (e.g. Add validation step)..."
+                    placeholder={diagramEditor.diagramType === 'cardflow' ? 'Describe change (e.g. Add validation step)...' : 'Describe change (e.g. Add validation step)...'}
                     disabled={diagramEditor.isAiLoading}
                     style={{
                       flex: 1,
@@ -5207,65 +5441,300 @@ export default function Workspace({
                 )}
               </div>
 
-              {/* Mermaid Source Code Textarea */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <label style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-color)' }}>Mermaid Source Code</label>
-                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>400ms live preview</span>
-                </div>
-                <textarea
-                  value={diagramEditor.currentCode}
-                  onChange={(e) => handleDiagramCodeChange(e.target.value)}
-                  rows={8}
-                  style={{
-                    width: '100%',
-                    fontFamily: "'Fira Code', 'Courier New', monospace",
-                    fontSize: '0.8rem',
-                    lineHeight: '1.45',
-                    padding: '0.6rem',
-                    border: '1px solid var(--border-color)',
-                    borderRadius: '6px',
-                    background: 'var(--bg-card, #ffffff)',
-                    color: 'var(--text-color)',
-                    resize: 'vertical',
-                    boxSizing: 'border-box'
-                  }}
-                />
-                {diagramEditor.syntaxError && (
-                  <div className="mermaid-panel-syntax-error" style={{
-                    fontSize: '0.75rem',
-                    color: '#b91c1c',
-                    background: '#fef2f2',
-                    border: '1px solid #fca5a5',
-                    borderRadius: '4px',
-                    padding: '0.4rem 0.6rem',
-                    lineHeight: '1.3'
-                  }}>
-                    ⚠️ Syntax error: {diagramEditor.syntaxError}
+              {/* CardFlow Specific Form */}
+              {diagramEditor.diagramType === 'cardflow' ? (
+                <>
+                  {/* Direction Switch */}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <label style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-color)' }}>Layout Direction</label>
+                    <div style={{ display: 'flex', gap: '0.25rem', background: 'var(--bg-hover, #f1f5f9)', padding: '2px', borderRadius: '6px' }}>
+                      <button
+                        type="button"
+                        onClick={() => setDiagramEditor(prev => ({
+                          ...prev,
+                          currentSpec: { ...(prev.currentSpec || { type: 'flow', nodes: [] }), direction: 'vertical' }
+                        }))}
+                        style={{
+                          padding: '0.3rem 0.6rem',
+                          fontSize: '0.75rem',
+                          fontWeight: 500,
+                          borderRadius: '4px',
+                          border: 'none',
+                          background: (diagramEditor.currentSpec?.direction !== 'horizontal') ? 'var(--bg-card, #ffffff)' : 'transparent',
+                          color: (diagramEditor.currentSpec?.direction !== 'horizontal') ? 'var(--primary-color, #4f46e5)' : 'var(--text-muted)',
+                          boxShadow: (diagramEditor.currentSpec?.direction !== 'horizontal') ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        Vertical (↓)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDiagramEditor(prev => ({
+                          ...prev,
+                          currentSpec: { ...(prev.currentSpec || { type: 'flow', nodes: [] }), direction: 'horizontal' }
+                        }))}
+                        style={{
+                          padding: '0.3rem 0.6rem',
+                          fontSize: '0.75rem',
+                          fontWeight: 500,
+                          borderRadius: '4px',
+                          border: 'none',
+                          background: (diagramEditor.currentSpec?.direction === 'horizontal') ? 'var(--bg-card, #ffffff)' : 'transparent',
+                          color: (diagramEditor.currentSpec?.direction === 'horizontal') ? 'var(--primary-color, #4f46e5)' : 'var(--text-muted)',
+                          boxShadow: (diagramEditor.currentSpec?.direction === 'horizontal') ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        Horizontal (→)
+                      </button>
+                    </div>
                   </div>
-                )}
-              </div>
 
-              {/* Live Preview */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', flex: 1 }}>
-                <label style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-color)' }}>Live Preview</label>
-                <div
-                  className="mermaid-panel-preview"
-                  style={{
-                    flex: 1,
-                    minHeight: '200px',
-                    border: '1px solid var(--border-color)',
-                    borderRadius: '6px',
-                    padding: '0.75rem',
-                    background: '#ffffff',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    overflow: 'auto'
-                  }}
-                  dangerouslySetInnerHTML={{ __html: diagramEditor.lastValidSvg || '<div style="color: #94a3b8; font-size: 0.8rem;">Diagram preview appears here...</div>' }}
-                />
-              </div>
+                  {/* Nodes List */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <label style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-color)' }}>
+                        Flow Stages ({diagramEditor.currentSpec?.nodes?.length || 0})
+                      </label>
+                      <button
+                        type="button"
+                        onClick={handleAddCardFlowNode}
+                        style={{
+                          padding: '0.25rem 0.55rem',
+                          fontSize: '0.75rem',
+                          fontWeight: 500,
+                          borderRadius: '4px',
+                          border: '1px solid var(--border-color)',
+                          background: 'var(--bg-card, #ffffff)',
+                          color: 'var(--primary-color, #4f46e5)',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        + Add Stage
+                      </button>
+                    </div>
+
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', maxHeight: '280px', overflowY: 'auto' }}>
+                      {(diagramEditor.currentSpec?.nodes || []).map((node, nIdx) => {
+                        const totalNodes = diagramEditor.currentSpec.nodes.length;
+                        return (
+                          <div
+                            key={nIdx}
+                            style={{
+                              border: '1px solid var(--border-color)',
+                              borderRadius: '8px',
+                              padding: '0.6rem 0.75rem',
+                              background: 'var(--bg-card, #ffffff)',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '0.45rem'
+                            }}
+                          >
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                              <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)' }}>
+                                Step {nIdx + 1}
+                              </span>
+                              <div style={{ display: 'flex', gap: '0.25rem' }}>
+                                <button
+                                  type="button"
+                                  onClick={() => handleMoveCardFlowNode(nIdx, 'up')}
+                                  disabled={nIdx === 0}
+                                  title="Move Up"
+                                  style={{
+                                    border: '1px solid var(--border-color)',
+                                    background: 'transparent',
+                                    borderRadius: '4px',
+                                    padding: '0.15rem 0.4rem',
+                                    fontSize: '0.75rem',
+                                    cursor: nIdx === 0 ? 'not-allowed' : 'pointer',
+                                    opacity: nIdx === 0 ? 0.4 : 1
+                                  }}
+                                >↑</button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleMoveCardFlowNode(nIdx, 'down')}
+                                  disabled={nIdx === totalNodes - 1}
+                                  title="Move Down"
+                                  style={{
+                                    border: '1px solid var(--border-color)',
+                                    background: 'transparent',
+                                    borderRadius: '4px',
+                                    padding: '0.15rem 0.4rem',
+                                    fontSize: '0.75rem',
+                                    cursor: nIdx === totalNodes - 1 ? 'not-allowed' : 'pointer',
+                                    opacity: nIdx === totalNodes - 1 ? 0.4 : 1
+                                  }}
+                                >↓</button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteCardFlowNode(nIdx)}
+                                  disabled={totalNodes <= 1}
+                                  title="Delete Stage"
+                                  style={{
+                                    border: '1px solid var(--border-color)',
+                                    background: 'transparent',
+                                    borderRadius: '4px',
+                                    padding: '0.15rem 0.4rem',
+                                    fontSize: '0.75rem',
+                                    color: '#dc2626',
+                                    cursor: totalNodes <= 1 ? 'not-allowed' : 'pointer',
+                                    opacity: totalNodes <= 1 ? 0.4 : 1
+                                  }}
+                                >✕</button>
+                              </div>
+                            </div>
+
+                            <input
+                              type="text"
+                              value={node.title || ''}
+                              onChange={(e) => handleUpdateCardFlowNode(nIdx, 'title', e.target.value)}
+                              placeholder="Title (max 4 words)"
+                              style={{
+                                width: '100%',
+                                padding: '0.35rem 0.5rem',
+                                fontSize: '0.8rem',
+                                fontWeight: 600,
+                                border: '1px solid var(--border-color)',
+                                borderRadius: '4px',
+                                background: 'var(--bg-card, #ffffff)',
+                                color: 'var(--text-color)',
+                                boxSizing: 'border-box'
+                              }}
+                            />
+
+                            <input
+                              type="text"
+                              value={node.subtitle || ''}
+                              onChange={(e) => handleUpdateCardFlowNode(nIdx, 'subtitle', e.target.value)}
+                              placeholder="Subtitle (max 8 words, optional)"
+                              style={{
+                                width: '100%',
+                                padding: '0.3rem 0.5rem',
+                                fontSize: '0.75rem',
+                                border: '1px solid var(--border-color)',
+                                borderRadius: '4px',
+                                background: 'var(--bg-card, #ffffff)',
+                                color: 'var(--text-color)',
+                                boxSizing: 'border-box'
+                              }}
+                            />
+
+                            {/* Color Pills */}
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', marginTop: '0.2rem' }}>
+                              <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Color:</span>
+                              {VALID_CARD_COLORS.map(cKey => {
+                                const cConfig = CARD_COLORS[cKey];
+                                const isSelected = (node.color || 'blue').toLowerCase() === cKey;
+                                return (
+                                  <button
+                                    key={cKey}
+                                    type="button"
+                                    onClick={() => handleUpdateCardFlowNode(nIdx, 'color', cKey)}
+                                    title={cKey}
+                                    style={{
+                                      width: '18px',
+                                      height: '18px',
+                                      borderRadius: '50%',
+                                      background: cConfig.bg,
+                                      border: isSelected ? '2px solid #4f46e5' : '1px solid rgba(0,0,0,0.15)',
+                                      cursor: 'pointer',
+                                      padding: 0,
+                                      boxSizing: 'border-box'
+                                    }}
+                                  />
+                                );
+                              })}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* CardFlow Live Preview */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', flex: 1 }}>
+                    <label style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-color)' }}>Live Preview</label>
+                    <div
+                      style={{
+                        background: '#0f172a',
+                        borderRadius: '8px',
+                        padding: '1rem',
+                        overflow: 'auto',
+                        minHeight: '160px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center'
+                      }}
+                    >
+                      <CardFlow spec={diagramEditor.currentSpec} />
+                    </div>
+                  </div>
+                </>
+              ) : (
+                /* Mermaid Specific View */
+                <>
+                  {/* Mermaid Source Code Textarea */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <label style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-color)' }}>Mermaid Source Code</label>
+                      <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>400ms live preview</span>
+                    </div>
+                    <textarea
+                      value={diagramEditor.currentCode}
+                      onChange={(e) => handleDiagramCodeChange(e.target.value)}
+                      rows={8}
+                      style={{
+                        width: '100%',
+                        fontFamily: "'Fira Code', 'Courier New', monospace",
+                        fontSize: '0.8rem',
+                        lineHeight: '1.45',
+                        padding: '0.6rem',
+                        border: '1px solid var(--border-color)',
+                        borderRadius: '6px',
+                        background: 'var(--bg-card, #ffffff)',
+                        color: 'var(--text-color)',
+                        resize: 'vertical',
+                        boxSizing: 'border-box'
+                      }}
+                    />
+                    {diagramEditor.syntaxError && (
+                      <div className="mermaid-panel-syntax-error" style={{
+                        fontSize: '0.75rem',
+                        color: '#b91c1c',
+                        background: '#fef2f2',
+                        border: '1px solid #fca5a5',
+                        borderRadius: '4px',
+                        padding: '0.4rem 0.6rem',
+                        lineHeight: '1.3'
+                      }}>
+                        ⚠️ Syntax error: {diagramEditor.syntaxError}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Mermaid Live Preview */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', flex: 1 }}>
+                    <label style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-color)' }}>Live Preview</label>
+                    <div
+                      className="mermaid-panel-preview"
+                      style={{
+                        flex: 1,
+                        minHeight: '200px',
+                        border: '1px solid var(--border-color)',
+                        borderRadius: '6px',
+                        padding: '0.75rem',
+                        background: '#ffffff',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        overflow: 'auto'
+                      }}
+                      dangerouslySetInnerHTML={{ __html: diagramEditor.lastValidSvg || '<div style="color: #94a3b8; font-size: 0.8rem;">Diagram preview appears here...</div>' }}
+                    />
+                  </div>
+                </>
+              )}
             </div>
 
             {/* Panel Footer */}
@@ -5303,7 +5772,9 @@ export default function Workspace({
                   color: '#ffffff',
                   cursor: 'pointer'
                 }}
-              >Save Diagram</button>
+              >
+                {diagramEditor.diagramType === 'cardflow' ? 'Save Card Flow' : 'Save Diagram'}
+              </button>
             </div>
           </aside>
         )}

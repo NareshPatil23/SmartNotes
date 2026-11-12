@@ -2,9 +2,11 @@
   "name": "smartnotes-ai",
   "version": "1.0.0",
   "scripts": {
-    "build": "cd backend && npm install",
+    "postinstall": "cd frontend && npm install && cd ../backend && npm install",
+    "build": "cd frontend && npm install && npm run build && node -e \"const fs = require('fs'); fs.cpSync('dist', '../dist', { recursive: true });\"",
+    "build:all": "cd backend && npm install && cd ../frontend && npm install && npm run build && node -e \"const fs = require('fs'); fs.cpSync('dist', '../dist', { recursive: true });\"",
     "build:backend": "cd backend && npm install",
-    "build:frontend": "cd frontend && npm install && npm run build",
+    "build:frontend": "cd frontend && npm install && npm run build && node -e \"const fs = require('fs'); fs.cpSync('dist', '../dist', { recursive: true });\"",
     "preview": "cd frontend && npm run preview",
     "start": "cd backend && node index.js"
   },

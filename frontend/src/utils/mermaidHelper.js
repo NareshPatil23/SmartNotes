@@ -1,5 +1,6 @@
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
+import { validateCardFlowSpec } from './cardFlowHelper.js';
 
 // Helper to get DOMPurify instance across browser and test/SSR environments
 const getPurify = () => {
@@ -533,6 +534,19 @@ export function formatAnswerWithDiagrams(rawText) {
     return `\n\`\`\`mermaid\n${code.trim()}\n\`\`\`\n`;
   });
 
+  // 3b. Extract ```cardflow or ```flow or JSON flow blocks and convert to cardflow-diagram-container
+  text = text.replace(/`{3,}(?:cardflow|flow|json)?\s*\r?\n([\s\S]*?)`{3,}/gi, (match, content) => {
+    const cleaned = content.trim();
+    if (cleaned.includes('"type"') && (cleaned.includes('"flow"') || cleaned.includes('"nodes"'))) {
+      const validated = validateCardFlowSpec(cleaned);
+      if (validated.valid) {
+        const encoded = encodeURIComponent(JSON.stringify(validated.normalizedSpec));
+        return `\n<div class="cardflow-diagram-container" data-cardflow-spec="${encoded}"><div class="cardflow-loading-placeholder" style="padding: 1rem; text-align: center; color: #94a3b8; font-size: 0.85rem; background: #1e293b; border: 1px dashed #475569; border-radius: 12px;">⏳ Loading flow diagram...</div></div>\n`;
+      }
+    }
+    return match;
+  });
+
   // 4. Extract ```mermaid, ```flowchart, ```sequenceDiagram, ```graph blocks and replace with safe container
   text = text.replace(/`{3,}(?:mermaid|flowchart|sequenceDiagram|graph)?\s*\r?\n([\s\S]*?)`{3,}/gi, (match, code) => {
     const cleaned = code.replace(/^`*(?:mermaid)?\s*\r?\n?/i, '').replace(/`*$/g, '').trim();
@@ -561,8 +575,8 @@ export function formatAnswerWithDiagrams(rawText) {
       'svg', 'g', 'path', 'text', 'rect', 'circle', 'line', 'polygon', 'polyline', 'marker', 'defs', 'foreignObject'
     ],
     ALLOWED_ATTR: [
-      'class', 'style', 'align', 'data-mermaid-code', 'data-rendered', 'data-theme',
-      'data-width-percent', 'data-diagram-id', 'data-previous-code', 'data-previous-width',
+      'class', 'style', 'align', 'data-mermaid-code', 'data-cardflow-spec', 'data-rendered', 'data-theme',
+      'data-width-percent', 'data-diagram-id', 'data-previous-code', 'data-previous-width', 'data-previous-spec',
       'viewBox', 'width', 'height', 'd', 'fill', 'stroke', 'stroke-width', 'transform', 'id', 'x', 'y', 'r', 'cx', 'cy',
       'x1', 'y1', 'x2', 'y2', 'points', 'marker-end', 'marker-start', 'text-anchor', 'dominant-baseline'
     ]

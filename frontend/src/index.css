@@ -636,7 +636,29 @@ body {
   user-select: none;
 }
 
-.mermaid-diagram-container:hover .mermaid-hover-toolbar {
+.mermaid-diagram-container:hover .mermaid-hover-toolbar,
+.cardflow-diagram-container:hover .mermaid-hover-toolbar,
+.cardflow-diagram-container:hover .cardflow-hover-toolbar {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.cardflow,
+.cardflow-diagram-container {
+  position: relative !important;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin: 1rem auto !important;
+  max-width: 100%;
+  overflow-x: auto !important;
+  overflow-y: visible !important;
+  page-break-inside: avoid !important;
+  break-inside: avoid !important;
+  transition: width 0.15s ease, max-width 0.15s ease;
+}
+
+.cardflow-diagram-container:hover .mermaid-resize-handle {
   opacity: 1;
   pointer-events: auto;
 }

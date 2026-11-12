@@ -1,6 +1,7 @@
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { hydrateMermaidContainers } from './mermaidHelper';
+import { renderCardFlowSvg, validateCardFlowSpec } from './cardFlowHelper.js';
 
 // In-memory cache for downloaded TTF font binary base64 strings
 const fontCache = new Map();
@@ -205,7 +206,69 @@ async function prepareExportMermaidDiagrams(exportDom) {
 
   await Promise.all(conversionPromises);
 
-  // 4. Remove any injected <style> text nodes left by Mermaid in the export DOM
+  // 4. Process all CardFlow diagram containers
+  const cardflowContainers = Array.from(exportDom.querySelectorAll('.cardflow-diagram-container, .cardflow'));
+  const cardflowPromises = cardflowContainers.map(async (container) => {
+    if (container.classList.contains('cardflow-error-banner') || container.querySelector('.cardflow-error-banner')) {
+      return;
+    }
+
+    container.querySelectorAll('[data-diagram-controls="true"], .mermaid-hover-toolbar, .cardflow-hover-toolbar, .mermaid-resize-handle').forEach(el => el.remove());
+
+    let spec = null;
+    const rawSpec = container.getAttribute('data-cardflow-spec');
+    if (rawSpec) {
+      try {
+        const parsed = JSON.parse(decodeURIComponent(rawSpec));
+        const val = validateCardFlowSpec(parsed);
+        if (val.valid) spec = val.normalizedSpec;
+      } catch (_) {}
+    } else {
+      const val = validateCardFlowSpec(container.textContent || '');
+      if (val.valid) spec = val.normalizedSpec;
+    }
+
+    if (!spec) return;
+
+    try {
+      const svgStr = renderCardFlowSvg(spec);
+      const parser = new DOMParser();
+      const svgDoc = parser.parseFromString(svgStr, 'image/svg+xml');
+      const svgEl = svgDoc.documentElement;
+
+      const pngResult = await svgElementToPngDataUrl(svgEl, 2.0);
+      if (pngResult && pngResult.dataUrl) {
+        const img = document.createElement('img');
+        img.src = pngResult.dataUrl;
+        img.className = 'mermaid-rendered-img cardflow-rendered-img';
+        img.style.maxWidth = '100%';
+        img.style.height = 'auto';
+        img.style.display = 'block';
+        img.style.margin = '0 auto';
+        img.setAttribute('data-original-width', String(pngResult.width));
+        img.setAttribute('data-original-height', String(pngResult.height));
+
+        const widthPercentAttr = container.getAttribute('data-width-percent');
+        if (widthPercentAttr) {
+          img.setAttribute('data-width-percent', widthPercentAttr);
+          img.style.maxWidth = `${widthPercentAttr}%`;
+          img.style.width = `${widthPercentAttr}%`;
+        }
+
+        container.innerHTML = '';
+        container.appendChild(img);
+        container.classList.add('cardflow-img-ready');
+        container.style.pageBreakInside = 'avoid';
+        container.style.breakInside = 'avoid';
+      }
+    } catch (err) {
+      console.warn('CardFlow to PNG conversion failed:', err);
+    }
+  });
+
+  await Promise.all(cardflowPromises);
+
+  // 5. Remove any injected <style> text nodes left by Mermaid in the export DOM
   exportDom.querySelectorAll('style[id*="mermaid"], style.mermaid-style').forEach(st => st.remove());
 }
 
@@ -887,9 +950,11 @@ async function renderNodeBlock(doc, node, ctx) {
     if (nextEl && (
       nextEl.classList?.contains('mermaid-diagram-container') ||
       nextEl.classList?.contains('mermaid') ||
-      nextEl.querySelector?.('.mermaid, svg, img.mermaid-rendered-img')
+      nextEl.classList?.contains('cardflow-diagram-container') ||
+      nextEl.classList?.contains('cardflow') ||
+      nextEl.querySelector?.('.mermaid, svg, img.mermaid-rendered-img, .cardflow, img.cardflow-rendered-img')
     )) {
-      const diagImg = nextEl.querySelector('img.mermaid-rendered-img, img');
+      const diagImg = nextEl.querySelector('img.mermaid-rendered-img, img.cardflow-rendered-img, img');
       let diagHeight = 60; // sensible estimated diagram height in mm
       if (diagImg) {
         const oW = parseFloat(diagImg.getAttribute('data-original-width')) || 600;
@@ -915,17 +980,19 @@ async function renderNodeBlock(doc, node, ctx) {
     return;
   }
 
-  // 2. Diagrams (Mermaid SVG & containers)
+  // 2. Diagrams (Mermaid SVG & containers & CardFlow)
   if (
-    (className.includes('mermaid') || tagName === 'SVG' || className.includes('mermaid-diagram-container') || node.querySelector('.mermaid, svg, .mermaid-diagram-container, img.mermaid-rendered-img')) &&
+    (className.includes('mermaid') || tagName === 'SVG' || className.includes('mermaid-diagram-container') || className.includes('cardflow') || className.includes('cardflow-diagram-container') || node.querySelector('.mermaid, svg, .mermaid-diagram-container, .cardflow, .cardflow-diagram-container, img.mermaid-rendered-img, img.cardflow-rendered-img')) &&
     !className.includes('mermaid-error-banner') &&
-    !node.querySelector('.mermaid-error-banner')
+    !node.querySelector('.mermaid-error-banner') &&
+    !className.includes('cardflow-error-banner') &&
+    !node.querySelector('.cardflow-error-banner')
   ) {
     let dataUrl = null;
     let width = 0;
     let height = 0;
 
-    const imgEl = node.tagName === 'IMG' ? node : node.querySelector('img.mermaid-rendered-img, img');
+    const imgEl = node.tagName === 'IMG' ? node : node.querySelector('img.mermaid-rendered-img, img.cardflow-rendered-img, img');
     if (imgEl && imgEl.src && imgEl.src.startsWith('data:image/')) {
       dataUrl = imgEl.src;
       width = parseFloat(imgEl.getAttribute('data-original-width')) || imgEl.naturalWidth || 600;
@@ -945,9 +1012,9 @@ async function renderNodeBlock(doc, node, ctx) {
       let baseWidth = Math.min(contentWidth, 160);
 
       // Check saved width percent (e.g. S=40%, M=70%, L=100% or custom drag percent)
-      const containerEl = (node.classList && (node.classList.contains('mermaid-diagram-container') || node.classList.contains('mermaid')))
+      const containerEl = (node.classList && (node.classList.contains('mermaid-diagram-container') || node.classList.contains('mermaid') || node.classList.contains('cardflow-diagram-container') || node.classList.contains('cardflow')))
         ? node
-        : (node.closest ? node.closest('.mermaid-diagram-container, .mermaid') : null);
+        : (node.closest ? node.closest('.mermaid-diagram-container, .mermaid, .cardflow-diagram-container, .cardflow') : null);
       const widthPercentVal = containerEl?.getAttribute?.('data-width-percent') ||
         node.getAttribute?.('data-width-percent') ||
         imgEl?.getAttribute?.('data-width-percent');

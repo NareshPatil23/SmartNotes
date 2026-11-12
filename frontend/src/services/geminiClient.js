@@ -16,6 +16,10 @@ import {
   resolvePreferredModel,
   getNextFallbackModel
 } from '../config/geminiConfig.js';
+import {
+  CARDFLOW_JSON_SCHEMA,
+  validateCardFlowSpec
+} from '../utils/cardFlowHelper.js';
 
 const STORAGE_KEY = 'smartnotes_gemini_api_key';
 const REMEMBER_KEY = 'smartnotes_gemini_remember';
@@ -219,6 +223,7 @@ export function sanitizeGenerationConfig(config = {}) {
   if (typeof config.topK === 'number') safe.topK = config.topK;
   if (Array.isArray(config.stopSequences)) safe.stopSequences = config.stopSequences;
   if (typeof config.responseMimeType === 'string') safe.responseMimeType = config.responseMimeType;
+  if (config.responseSchema && typeof config.responseSchema === 'object') safe.responseSchema = config.responseSchema;
   return safe;
 }
 
@@ -471,7 +476,22 @@ ${isHandwritten ? `HANDWRITTEN MODE:
 - Convert formulas into $$...$$ or $...$.
 - Wrap code blocks in <pre><code class="language-[lang]">[code]</code></pre>.
 - Wrap tables in standard <table>, <thead>, <tbody>, <th>, <td>.
-- Wrap text/ASCII diagrams in <div class="mermaid">...</div>.`}
+- PROCESS FLOWS & DIAGRAMS (AUTO-CHOOSE):
+  * For linear processes, sequential stages, lifecycles, and step-by-step procedures (3-8 stages):
+    Use a "card flow" diagram. Output:
+    \`\`\`cardflow
+    {
+      "type": "flow",
+      "direction": "vertical",
+      "nodes": [
+        { "title": "Stage Title", "subtitle": "Brief description", "color": "blue" }
+      ]
+    }
+    \`\`\`
+    (Rules: 3-8 nodes, title max 4 words, subtitle max 8 words, pastel colors: blue, green, orange, purple, pink, gray to group related stages).
+  * For complex architectures, loops, decision trees, or multi-branch flows:
+    Use Mermaid:
+    <div class="mermaid">...</div>.`}
 
 STRICT WORD FIDELITY:
 - Retain all core academic content and wording accurately, adding semantic formatting and LaTeX math.`;
@@ -615,7 +635,7 @@ export async function runWithConcurrency(tasks, limit = 3, onTaskComplete = null
 export async function extractNotesDirect({ text, inlineData = null, model = null, apiKey = null }) {
   const systemInstruction = `You are an expert academic text-to-HTML study note generation tool.
 Extract comprehensive Question and Answer study pairs from the material.
-For the "answer" field, return beautifully formatted semantic HTML (<p>, <strong>, <ul>, <li>, <mark>, <table>, <pre><code>).
+For the "answer" field, return beautifully formatted semantic HTML (<p>, <strong>, <ul>, <li>, <mark>, <table>, <pre><code>, \`\`\`cardflow for sequential processes, and <div class="mermaid"> for complex diagrams).
 Use $$...$$ for block math and $...$ for inline math.
 
 CRITICAL OUTPUT FORMAT:
@@ -801,4 +821,208 @@ Please fix the error and output ONLY the 100% valid Mermaid diagram code without
   }
 
   return { success: true, code: cleanedCode };
+}
+
+/**
+ * Generates a structured CardFlow diagram from text using Gemini with schema enforcement.
+ * Includes 429 exponential backoff, 1-attempt syntax retry, and fallback to Mermaid/text.
+ */
+export async function generateCardFlowWithAI({
+  text,
+  instruction = '',
+  model = null,
+  apiKey = null
+}) {
+  if (!text || !text.trim()) {
+    throw new Error('No text provided to generate CardFlow.');
+  }
+
+  const systemInstruction = `You are an expert academic diagram designer. Transform the input into a structured sequential CardFlow JSON diagram.
+RULES:
+1. Output 3 to 8 nodes representing the logical sequence or lifecycle stages.
+2. Title must be concise (maximum 4 words).
+3. Subtitle must be clear (maximum 8 words).
+4. Assign meaningful pastel colors: "blue", "green", "orange", "purple", "pink", or "gray" to group related stages.
+5. Return ONLY valid JSON matching the schema.`;
+
+  const prompt = `Text to visualize as a CardFlow diagram:
+${text.trim()}
+${instruction ? `\nAdditional constraint: ${instruction.trim()}` : ''}
+
+Output ONLY the JSON:`;
+
+  const callWithBackoff = async (pText, withSchema = true) => {
+    const MAX_RETRIES = 3;
+    let delay = 1000;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const generationConfig = {
+          responseMimeType: 'application/json'
+        };
+        if (withSchema) {
+          generationConfig.responseSchema = CARDFLOW_JSON_SCHEMA;
+        }
+        const data = await callGeminiGenerateContent({
+          prompt: pText,
+          systemInstruction,
+          model,
+          apiKey,
+          generationConfig
+        });
+        return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      } catch (err) {
+        const is429 = err.status === 429 ||
+          (err.message || '').toLowerCase().includes('quota') ||
+          (err.message || '').toLowerCase().includes('rate limit') ||
+          (err.message || '').toLowerCase().includes('resource_exhausted') ||
+          (err.message || '').toLowerCase().includes('429');
+
+        if (is429 && attempt < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, delay));
+          delay *= 2;
+          continue;
+        }
+        throw err;
+      }
+    }
+  };
+
+  // Attempt 1: Schema-driven generation
+  try {
+    const rawOutput = await callWithBackoff(prompt, true);
+    const val = validateCardFlowSpec(rawOutput);
+    if (val.valid) {
+      return { success: true, spec: val.normalizedSpec, type: 'cardflow' };
+    }
+
+    // Attempt 2: Retry once with error feedback
+    const retryPrompt = `The previous JSON had a validation issue: ${val.error}.
+Generate ONLY valid JSON matching the CardFlow schema for this text:
+${text.trim()}`;
+    const retryOutput = await callWithBackoff(retryPrompt, false);
+    const retryVal = validateCardFlowSpec(retryOutput);
+    if (retryVal.valid) {
+      return { success: true, spec: retryVal.normalizedSpec, type: 'cardflow' };
+    }
+  } catch (err) {
+    console.warn('CardFlow AI generation attempt failed, falling back:', err);
+  }
+
+  // Fallback to Mermaid flowchart
+  try {
+    const fallbackPrompt = `Convert this process into a simple, valid Mermaid flowchart:
+${text.trim()}
+Output ONLY the raw Mermaid code starting with flowchart TD:`;
+    const mermaidRaw = await callWithBackoff(fallbackPrompt, false);
+    const cleanMermaid = stripMermaidFences(mermaidRaw);
+    return { success: true, code: cleanMermaid, type: 'mermaid' };
+  } catch (_) {
+    return { success: false, error: 'Could not generate diagram' };
+  }
+}
+
+/**
+ * Edit an existing CardFlow diagram with AI instruction.
+ * Validates with schema check, retries once on failure, reuses 429 backoff and fallback model.
+ */
+export async function editCardFlowWithAI({
+  currentSpec,
+  instruction,
+  model = null,
+  apiKey = null
+}) {
+  if (!instruction || !instruction.trim()) {
+    throw new Error('Please describe the change you want to make.');
+  }
+  if (!currentSpec || !currentSpec.nodes) {
+    throw new Error('No current CardFlow spec provided.');
+  }
+
+  const systemInstruction = `You are an expert CardFlow diagram designer.
+Update the provided CardFlow JSON specification according to the user's instructions.
+CRITICAL RULES:
+1. Maintain 3 to 8 nodes unless instructed otherwise.
+2. Title maximum 4 words, subtitle maximum 8 words.
+3. Colors must be one of: "blue", "green", "orange", "purple", "pink", "gray".
+4. Output ONLY valid JSON matching the schema.`;
+
+  const prompt = `Current CardFlow JSON:
+${JSON.stringify(currentSpec, null, 2)}
+
+Requested Change:
+${instruction.trim()}
+
+Output the updated CardFlow JSON:`;
+
+  const callWithBackoff = async (pText, withSchema = true) => {
+    const MAX_RETRIES = 3;
+    let delay = 1000;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const generationConfig = {
+          responseMimeType: 'application/json'
+        };
+        if (withSchema) {
+          generationConfig.responseSchema = CARDFLOW_JSON_SCHEMA;
+        }
+        const data = await callGeminiGenerateContent({
+          prompt: pText,
+          systemInstruction,
+          model,
+          apiKey,
+          generationConfig
+        });
+        return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      } catch (err) {
+        const is429 = err.status === 429 ||
+          (err.message || '').toLowerCase().includes('quota') ||
+          (err.message || '').toLowerCase().includes('rate limit') ||
+          (err.message || '').toLowerCase().includes('resource_exhausted') ||
+          (err.message || '').toLowerCase().includes('429');
+
+        if (is429 && attempt < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, delay));
+          delay *= 2;
+          continue;
+        }
+        throw err;
+      }
+    }
+  };
+
+  // Attempt 1
+  try {
+    const rawOutput = await callWithBackoff(prompt, true);
+    const val = validateCardFlowSpec(rawOutput);
+    if (val.valid) {
+      return { success: true, spec: val.normalizedSpec };
+    }
+
+    // Attempt 2: Retry once
+    const retryPrompt = `The previous update produced an invalid schema: ${val.error}.
+Please fix it and return ONLY valid CardFlow JSON:
+Current CardFlow:
+${JSON.stringify(currentSpec, null, 2)}
+
+Requested Change:
+${instruction.trim()}`;
+
+    const retryOutput = await callWithBackoff(retryPrompt, false);
+    const retryVal = validateCardFlowSpec(retryOutput);
+    if (retryVal.valid) {
+      return { success: true, spec: retryVal.normalizedSpec };
+    }
+
+    return {
+      success: false,
+      spec: currentSpec,
+      error: retryVal.error || 'AI returned invalid CardFlow schema.'
+    };
+  } catch (err) {
+    return {
+      success: false,
+      spec: currentSpec,
+      error: err.message || 'Error communicating with Gemini service.'
+    };
+  }
 }

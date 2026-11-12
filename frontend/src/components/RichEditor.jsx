@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useImperativeHandle, forwardRef, useState, useCallback } from 'react';
 import { marked } from 'marked';
 import { hasMermaidDiagram, isMermaidCode, formatAnswerWithDiagrams, hydrateMermaidContainers } from '../utils/mermaidHelper';
+import { hydrateCardFlowContainers } from '../utils/cardFlowHelper';
 
 const COMMANDS = [
   { id: 'h1', label: 'Heading 1', icon: 'H1', category: 'Basic Blocks' },
@@ -203,6 +204,7 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
         setTimeout(() => {
           if (editorRef.current) {
             hydrateMermaidContainers(editorRef.current, isDark);
+            hydrateCardFlowContainers(editorRef.current, isDark);
           }
         }, 30);
       }
@@ -224,6 +226,31 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
         container.remove();
         handleInput();
       } else if (action === 'undo') {
+        const diagramType = e.detail?.diagramType;
+        const isDark = document.body.classList.contains('dark-theme');
+
+        if (diagramType === 'cardflow') {
+          const prevSpec = container.getAttribute('data-previous-spec');
+          const prevWidth = container.getAttribute('data-previous-width');
+          const curSpec = container.getAttribute('data-cardflow-spec');
+          const curWidth = container.getAttribute('data-width-percent') || '100';
+
+          if (prevSpec) {
+            container.setAttribute('data-cardflow-spec', prevSpec);
+            container.setAttribute('data-previous-spec', curSpec);
+          }
+          if (prevWidth) {
+            container.setAttribute('data-width-percent', prevWidth);
+            container.setAttribute('data-previous-width', curWidth);
+            container.style.width = `${prevWidth}%`;
+            container.style.maxWidth = `${prevWidth}%`;
+          }
+          container.removeAttribute('data-rendered');
+          hydrateCardFlowContainers(editorEl, isDark);
+          handleInput();
+          return;
+        }
+
         const prevCode = container.getAttribute('data-previous-code');
         const prevWidth = container.getAttribute('data-previous-width');
         const curCode = container.getAttribute('data-mermaid-code');
@@ -240,7 +267,6 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
           container.style.maxWidth = `${prevWidth}%`;
         }
         container.removeAttribute('data-rendered');
-        const isDark = document.body.classList.contains('dark-theme');
         hydrateMermaidContainers(editorEl, isDark);
         handleInput();
       }
@@ -262,6 +288,7 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
       setTimeout(() => {
         if (editorRef.current) {
           hydrateMermaidContainers(editorRef.current, isDark);
+          hydrateCardFlowContainers(editorRef.current, isDark);
         }
       }, 30);
     },
@@ -269,6 +296,7 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
       if (editorRef.current) {
         const isDark = document.body.classList.contains('dark-theme');
         hydrateMermaidContainers(editorRef.current, isDark);
+        hydrateCardFlowContainers(editorRef.current, isDark);
       }
     },
     clear: () => {
@@ -283,7 +311,7 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
     const text = e.clipboardData.getData('text/plain');
     const isDark = document.body.classList.contains('dark-theme');
 
-    const containsDiagram = isMermaidCode(text) || hasMermaidDiagram(text) || (html && (html.includes('language-mermaid') || html.includes('mermaid-diagram-container') || html.includes('class="mermaid"')));
+    const containsDiagram = isMermaidCode(text) || hasMermaidDiagram(text) || (text && (text.includes('```cardflow') || text.includes('```flow'))) || (html && (html.includes('language-mermaid') || html.includes('mermaid-diagram-container') || html.includes('class="mermaid"') || html.includes('cardflow-diagram-container') || html.includes('cardflow')));
     const isMarkdown = containsDiagram || (text && (text.includes('**') || text.includes('###') || text.includes('```') || /^\d+\.\s/m.test(text) || /^-\s/m.test(text) || text.includes('\\[') || text.includes('$$') || text.includes('\\(') || text.includes('\\text{')));
 
     if (containsDiagram) {
@@ -296,6 +324,7 @@ const RichEditor = forwardRef(({ initialValue, onChange, className }, ref) => {
       setTimeout(() => {
         if (editorRef.current) {
           hydrateMermaidContainers(editorRef.current, isDark);
+          hydrateCardFlowContainers(editorRef.current, isDark);
         }
       }, 50);
       return;

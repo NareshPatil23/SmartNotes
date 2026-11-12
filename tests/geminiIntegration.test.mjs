@@ -62,7 +62,9 @@ const {
   removeApiKey,
   sanitizeGenerationConfig,
   stripMermaidFences,
-  editMermaidWithAI
+  editMermaidWithAI,
+  generateCardFlowWithAI,
+  editCardFlowWithAI
 } = await import('../frontend/src/services/geminiClient.js');
 
 const {
@@ -79,6 +81,15 @@ const {
   isMermaidCode,
   validateMermaidCode
 } = await import('../frontend/src/utils/mermaidHelper.js');
+
+const {
+  validateCardFlowSpec,
+  CARDFLOW_JSON_SCHEMA,
+  VALID_CARD_COLORS,
+  renderCardFlowHtml,
+  renderCardFlowSvg,
+  escapeHtml
+} = await import('../frontend/src/utils/cardFlowHelper.js');
 
 describe('Gemini Model Configuration & Central Architecture', () => {
   test('Central configuration defaults to gemini-3.6-flash and ordered fallbacks', () => {
@@ -1281,5 +1292,185 @@ describe('Mermaid Diagram Resize, Edit, AI Modification, and PDF Export', () => 
     container.setAttribute('data-mermaid-code', restoredCode);
     container.removeAttribute('data-previous-code');
     assert.equal(decodeURIComponent(container.getAttribute('data-mermaid-code')), 'flowchart TD\n  A-->B');
+  });
+
+  describe('Card Flow Diagrams (Stacked Pastel Cards with Arrows)', () => {
+    test('validateCardFlowSpec validates valid spec, normalizes pastel colors, and rejects bad inputs', () => {
+      // Empty input
+      const r1 = validateCardFlowSpec(null);
+      assert.equal(r1.valid, false);
+
+      // Non-flow type
+      const r2 = validateCardFlowSpec({ type: 'unknown', nodes: [] });
+      assert.equal(r2.valid, false);
+
+      // Empty nodes
+      const r3 = validateCardFlowSpec({ type: 'flow', nodes: [] });
+      assert.equal(r3.valid, false);
+
+      // Valid spec with markdown fence stripping
+      const fencedJson = '```cardflow\n{\n  "type": "flow",\n  "direction": "vertical",\n  "nodes": [\n    { "title": "Step 1", "subtitle": "Init", "color": "BLUE" },\n    { "title": "Step 2", "color": "invalid_color" }\n  ]\n}\n```';
+      const r4 = validateCardFlowSpec(fencedJson);
+      assert.equal(r4.valid, true);
+      assert.equal(r4.normalizedSpec.nodes.length, 2);
+      assert.equal(r4.normalizedSpec.nodes[0].color, 'blue', 'Normalized color to lowercase');
+      assert.equal(r4.normalizedSpec.nodes[1].color, 'blue', 'Fallback invalid color to blue');
+    });
+
+    test('renderCardFlowHtml strictly escapes user text to prevent XSS (never raw HTML)', () => {
+      const maliciousSpec = {
+        type: 'flow',
+        direction: 'vertical',
+        nodes: [
+          {
+            title: '<script>alert("hack")</script>',
+            subtitle: '<img src=x onerror=alert(1)>',
+            color: 'green'
+          }
+        ]
+      };
+
+      const html = renderCardFlowHtml(maliciousSpec);
+      assert.ok(!html.includes('<script>'), 'Must not contain raw <script>');
+      assert.ok(!html.includes('<img src=x onerror=alert(1)>'), 'Must not contain raw <img> tag');
+      assert.ok(html.includes('&lt;script&gt;alert(&quot;hack&quot;)&lt;/script&gt;'), 'Escapes script tags');
+      assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;'), 'Escapes img tags');
+    });
+
+    test('renderCardFlowSvg generates valid SVG without foreignObject for PDF export rasterization', () => {
+      const spec = {
+        type: 'flow',
+        direction: 'vertical',
+        nodes: [
+          { title: 'Data Extraction', subtitle: 'Capture memory and disk', color: 'blue' },
+          { title: 'Hash Verification', subtitle: 'SHA-256 integrity check', color: 'green' }
+        ]
+      };
+
+      const svg = renderCardFlowSvg(spec);
+      assert.ok(svg.startsWith('<svg'), 'Starts with SVG opening tag');
+      assert.ok(svg.includes('xmlns="http://www.w3.org/2000/svg"'), 'Has SVG xmlns');
+      assert.ok(!svg.includes('foreignObject'), 'Must NOT contain foreignObject');
+      assert.ok(svg.includes('#1e293b'), 'Uses dark background container #1e293b');
+      assert.ok(svg.includes('↓'), 'Contains vertical down arrow');
+      assert.ok(svg.includes('Data Extraction'), 'Contains node title');
+    });
+
+    test('CardFlow 3 test diagrams: Testing Levels, SDLC Phases, Forensic Validation Steps', () => {
+      // 1. Testing Levels
+      const testingSpec = {
+        type: 'flow',
+        direction: 'vertical',
+        nodes: [
+          { title: 'Unit Testing', subtitle: 'Isolated component validation', color: 'blue' },
+          { title: 'Integration Testing', subtitle: 'Module interaction verification', color: 'green' },
+          { title: 'System Testing', subtitle: 'End-to-end functionality', color: 'orange' },
+          { title: 'Acceptance Testing', subtitle: 'User requirements sign-off', color: 'purple' }
+        ]
+      };
+      const vTesting = validateCardFlowSpec(testingSpec);
+      assert.equal(vTesting.valid, true);
+      const svgTesting = renderCardFlowSvg(vTesting.normalizedSpec);
+      assert.ok(svgTesting.includes('Unit Testing') && svgTesting.includes('Acceptance Testing'));
+
+      // 2. SDLC Phases
+      const sdlcSpec = {
+        type: 'flow',
+        direction: 'vertical',
+        nodes: [
+          { title: 'Requirements', subtitle: 'Specification gathering', color: 'blue' },
+          { title: 'Architecture Design', subtitle: 'System layout & database', color: 'green' },
+          { title: 'Implementation', subtitle: 'Coding and unit tests', color: 'orange' },
+          { title: 'Verification', subtitle: 'QA and deployment', color: 'purple' },
+          { title: 'Maintenance', subtitle: 'Monitoring and updates', color: 'gray' }
+        ]
+      };
+      const vSdlc = validateCardFlowSpec(sdlcSpec);
+      assert.equal(vSdlc.valid, true);
+      const svgSdlc = renderCardFlowSvg(vSdlc.normalizedSpec);
+      assert.ok(svgSdlc.includes('Requirements') && svgSdlc.includes('Maintenance'));
+
+      // 3. Forensic Validation Steps
+      const forensicSpec = {
+        type: 'flow',
+        direction: 'vertical',
+        nodes: [
+          { title: 'Evidence Collection', subtitle: 'Live volatile data & disk images', color: 'blue' },
+          { title: 'Integrity Verification', subtitle: 'SHA-1 and SHA-256 hashing', color: 'green' },
+          { title: 'Forensic Analysis', subtitle: 'Artifact timeline reconstruction', color: 'orange' },
+          { title: 'Chain of Custody', subtitle: 'Documented report & findings', color: 'pink' }
+        ]
+      };
+      const vForensic = validateCardFlowSpec(forensicSpec);
+      assert.equal(vForensic.valid, true);
+      const svgForensic = renderCardFlowSvg(vForensic.normalizedSpec);
+      assert.ok(svgForensic.includes('Evidence Collection') && svgForensic.includes('Chain of Custody'));
+    });
+
+    test('editCardFlowWithAI updates spec with Gemini, retrying on invalid schema', async () => {
+      const originalFetch = global.fetch;
+      let callCount = 0;
+
+      try {
+        global.fetch = async (url, options) => {
+          callCount++;
+          if (callCount === 1) {
+            // First attempt: invalid schema
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                candidates: [{
+                  content: {
+                    parts: [{ text: '{"type":"wrong_type","nodes":[]}' }]
+                  }
+                }]
+              })
+            };
+          } else {
+            // Second attempt (retry): valid schema with added step
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                candidates: [{
+                  content: {
+                    parts: [{
+                      text: JSON.stringify({
+                        type: 'flow',
+                        direction: 'vertical',
+                        nodes: [
+                          { title: 'Step 1', subtitle: 'Start', color: 'blue' },
+                          { title: 'Step 2', subtitle: 'Added validation', color: 'green' }
+                        ]
+                      })
+                    }]
+                  }
+                }]
+              })
+            };
+          }
+        };
+
+        const initialSpec = {
+          type: 'flow',
+          direction: 'vertical',
+          nodes: [{ title: 'Step 1', subtitle: 'Start', color: 'blue' }]
+        };
+
+        const result = await editCardFlowWithAI({
+          currentSpec: initialSpec,
+          instruction: 'Add step 2 for validation',
+          apiKey: 'test-api-key'
+        });
+
+        assert.equal(callCount, 2, 'Retried once on invalid schema');
+        assert.equal(result.success, true);
+        assert.equal(result.spec.nodes.length, 2);
+        assert.equal(result.spec.nodes[1].title, 'Step 2');
+      } finally {
+        global.fetch = originalFetch;
+      }
+    });
   });
 });
